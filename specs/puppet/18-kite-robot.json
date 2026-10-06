@@ -1,0 +1,19 @@
+{
+ "name": "18-kite-robot",
+ "units": "normalized",
+ "notes": "Kite robot (hy3d, 50k tris). The diamond sheet is tilted ~45 deg (top at the back, z 0.05; bottom at the front, z 0.48) and is the hard body. Head: a feathered sphere over the top of the diamond, smooth, so a yaw bends the top instead of tearing it. Tail: the red ribbon from the sheet's lower-left (0.35,0.45,0.40) curling forward to the bow on the floor (0.12,0.02,0.88), a 4-bone smooth chain with capsules plus a sphere for the bow. Thin arms hang behind the lower fins from (0.29,0.47,0.22) and (0.72,0.47,0.23) to hands at y 0.28; smooth capsules so the shoulder blends into the sheet. Legs, feet, fins, spars and bridle stay with the body. Derived from vertex clusters, 2026-10-02.",
+ "bones": [
+  {"name": "root", "role": "root", "parent": null, "head": [0.5, 0.0, 0.5], "tail": [0.5, 0.08, 0.5], "mask": null},
+  {"name": "body", "role": "body", "parent": "root", "head": [0.5, 0.44, 0.48], "tail": [0.5, 0.78, 0.21], "mask": "rest"},
+  {"name": "head", "role": "head", "parent": "body", "head": [0.5, 0.78, 0.21], "tail": [0.5, 0.99, 0.05],
+   "mask": {"sphere": {"c": [0.5, 0.90, 0.10], "r": 0.13, "feather": 0.6}}, "weights": "smooth"},
+  {"name": "tail", "role": "tail", "parent": "body",
+   "points": [[0.355, 0.45, 0.39], [0.33, 0.31, 0.44], [0.30, 0.17, 0.54], [0.24, 0.05, 0.70], [0.12, 0.02, 0.88]],
+   "mask": [{"capsule": {"r": 0.035, "extend": 0.1}}, {"sphere": {"c": [0.13, 0.02, 0.86], "r": 0.2, "feather": 0.3}}],
+   "weights": "smooth", "soft": 0.04},
+  {"name": "arm.R", "role": "arm.R", "parent": "body", "head": [0.29, 0.47, 0.22], "tail": [0.20, 0.27, 0.34],
+   "mask": {"capsule": {"r": 0.05, "extend": 0.05}, "feather": 0.4}, "weights": "smooth"},
+  {"name": "arm.L", "role": "arm.L", "parent": "body", "head": [0.72, 0.47, 0.23], "tail": [0.80, 0.29, 0.34],
+   "mask": {"capsule": {"r": 0.05, "extend": 0.05}, "feather": 0.4}, "weights": "smooth"}
+ ]
+}

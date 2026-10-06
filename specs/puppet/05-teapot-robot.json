@@ -1,0 +1,212 @@
+{
+ "name": "05-teapot-robot",
+ "units": "normalized",
+ "notes": "Teapot robot (hy3d, 50k tris). Round body (ellipsoid about (0.5,0.40,0.5)), gold rim at y 0.63-0.66, lid dome + knob above it (knob centred x 0.55). Spout on -X from the body flank (y 0.50) to its tip (0.14,0.74); the steam puff above y 0.76 is a 2-bone smooth 'antenna' chain so idle can sway it. Two stub arms: character's right at the back-left (0.20,0.25,0.32), left at the front-right (0.80,0.29,0.78). Handle, eyes and the four brass legs stay with the body. Derived from vertex slices and radial bump profiles, 2026-10-02. 2026-10-02: cap=true on lid so the interior stays hidden when it moves.",
+ "bones": [
+  {
+   "name": "root",
+   "role": "root",
+   "parent": null,
+   "head": [
+    0.5,
+    0.0,
+    0.5
+   ],
+   "tail": [
+    0.5,
+    0.08,
+    0.5
+   ],
+   "mask": null
+  },
+  {
+   "name": "body",
+   "role": "body",
+   "parent": "root",
+   "head": [
+    0.5,
+    0.1,
+    0.5
+   ],
+   "tail": [
+    0.5,
+    0.65,
+    0.5
+   ],
+   "mask": "rest"
+  },
+  {
+   "name": "lid",
+   "role": "lid",
+   "parent": "body",
+   "head": [
+    0.55,
+    0.66,
+    0.5
+   ],
+   "tail": [
+    0.55,
+    0.86,
+    0.5
+   ],
+   "mask": {
+    "box": [
+     [
+      0.3,
+      0.66,
+      0.15
+     ],
+     [
+      0.8,
+      1.1,
+      0.85
+     ]
+    ]
+   },
+   "priority": 2,
+   "cap": true
+  },
+  {
+   "name": "spout",
+   "role": "spout",
+   "parent": "body",
+   "head": [
+    0.21,
+    0.5,
+    0.5
+   ],
+   "tail": [
+    0.14,
+    0.74,
+    0.5
+   ],
+   "mask": {
+    "any": [
+     {
+      "box": [
+       [
+        -0.1,
+        0.44,
+        0.28
+       ],
+       [
+        0.27,
+        0.76,
+        0.74
+       ]
+      ]
+     }
+    ],
+    "not": [
+     {
+      "ellipsoid": {
+       "c": [
+        0.5,
+        0.4,
+        0.5
+       ],
+       "r": [
+        0.345,
+        0.32,
+        0.51
+       ]
+      }
+     }
+    ]
+   },
+   "priority": 3
+  },
+  {
+   "name": "steam",
+   "role": "antenna",
+   "parent": "spout",
+   "points": [
+    [
+     0.14,
+     0.76,
+     0.5
+    ],
+    [
+     0.11,
+     0.87,
+     0.5
+    ],
+    [
+     0.1,
+     0.99,
+     0.5
+    ]
+   ],
+   "mask": {
+    "box": [
+     [
+      -0.1,
+      0.76,
+      0.2
+     ],
+     [
+      0.3,
+      1.1,
+      0.8
+     ]
+    ],
+    "feather": 0.3
+   },
+   "weights": "smooth",
+   "soft": 0.05,
+   "priority": 4
+  },
+  {
+   "name": "arm.R",
+   "role": "arm.R",
+   "parent": "body",
+   "head": [
+    0.25,
+    0.27,
+    0.34
+   ],
+   "tail": [
+    0.16,
+    0.23,
+    0.3
+   ],
+   "mask": {
+    "sphere": {
+     "c": [
+      0.195,
+      0.25,
+      0.32
+     ],
+     "r": 0.06
+    }
+   },
+   "priority": 3
+  },
+  {
+   "name": "arm.L",
+   "role": "arm.L",
+   "parent": "body",
+   "head": [
+    0.75,
+    0.3,
+    0.76
+   ],
+   "tail": [
+    0.84,
+    0.27,
+    0.8
+   ],
+   "mask": {
+    "sphere": {
+     "c": [
+      0.805,
+      0.29,
+      0.785
+     ],
+     "r": 0.06
+    }
+   },
+   "priority": 3
+  }
+ ]
+}

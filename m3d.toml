@@ -1,0 +1,245 @@
+# m3d registry: the one place image models and mesh engines are named.
+# bin/m3d builds every command it runs from these rows. To swap or add a
+# model, edit a row here, never the script (2026-09-26: a config-selected
+# seam on every model).
+#
+# Placeholders in commands: {image} {out} {prompt} {seed} {width} {height}
+# and, in [riggers.*] / [motion.*], {glb} {spec} {device} {clips} {fps} {seconds};
+# plus any key from [paths]. `env` values are filled the same way.
+
+[paths]
+# Paths expand ~ and environment variables. bin/m3d sets defaults for M3D_ROOT (this checkout),
+# M3D_REPOS (~/repos: the upstream engine clones), M3D_OUT (~/3d/m3d) and M3D_BLENDER; export
+# any of them to point m3d elsewhere, or edit a row.
+out          = "$M3D_OUT"
+hy3d_repo    = "$M3D_REPOS/Hunyuan3D-Swift"
+hy3d         = "$M3D_REPOS/Hunyuan3D-Swift/.build/release/hy3d"
+hy3d_weights = "$M3D_REPOS/Hunyuan3D-Swift/weights"
+# hy3d-mcp's workers (cutout, normals, meshinfo) are reused as-is, run under
+# the worker venv its install.sh built.
+worker_py    = "~/.hy3d/worker-venv/bin/python"
+workers      = "$M3D_REPOS/hy3d-mcp/src/hy3d_mcp/workers"
+blender      = "$M3D_BLENDER"
+comfy_py     = "$M3D_REPOS/ComfyUI/.venv/bin/python"
+lib          = "$M3D_ROOT/lib"
+# Rig / animate (2026-10-02). skin-tokens.cpp is built from the pristine clone; the
+# GGUF weights come from LocalAI-io/SkinTokens-GGUF; MoMask's venv, checkpoints and
+# launcher live in ~/.momask (lib/momask.py writes the launcher).
+skintokens_cli     = "$M3D_REPOS/skin-tokens.cpp/build/release/bin/skintokens-cli"
+skintokens_weights = "~/.skintokens/gguf/F16"
+momask_home        = "~/.momask"
+momask_repo        = "$M3D_REPOS/momask-codes"
+
+# Stage limits (2026-10-01, after a Pixal3D job sat silent ~12 h on the GPU).
+# A stage stops when its log (and ComfyUI's server log) is silent this long,
+# or when it passes its limit; engines set their own max_seconds.
+[limits]
+stall_seconds   = 900
+concept_seconds = 600
+post_seconds    = 1800
+# Memory caps for bin/memguard (GiB of RSS; the job is killed above it or when system
+# free memory drops under 15%). Every rig/animate child runs under one (2026-10-02,
+# after an orphaned trimesh run reached 266 GB). Riggers and motion rows may set cap_gib.
+cap_blender_gib = 16
+cap_python_gib  = 8
+
+[defaults]
+image_model = "zimage-turbo"
+engine      = "hy3d"
+width       = 1024
+height      = 1024
+
+# The concept image is the biggest quality lever (hy3d-mcp doctrine, measured
+# there: a clean evenly-lit input gave 31% more geometry than painted concept
+# art of the same object). Every text prompt is wrapped in this template.
+[concept]
+template = "{prompt}. Single object, whole object in frame, centered, three-quarter view, isolated on a seamless plain light gray background, catalog product shot, soft even neutral studio lighting, floating, no shadow, no contact shadow, no text, no watermark, highly detailed, sharp focus"
+negative = "multiple objects, cropped, cut off, background scenery, gradient background, vignette, drop shadow, contact shadow, floor, dramatic lighting, rim light, text, watermark, frame, blurry"
+# --rig-ready (2026-10-03, the pi teddy test): a character that will be rigged must be drawn with its limbs held
+# AWAY from the body. The teddy concept had its arms hanging against its sides; Hunyuan fused each arm to the
+# torso from armpit to hip, SkinTokens bound that strip half to the hip and half to the forearm, and every arm
+# raise dragged a sheet of belly skin with it. Auto-riggers, Meshy's included,
+# ask for an A-pose or T-pose for this reason. Front view (symmetric), gaps under the arms and between the legs.
+# The first wording ("A-pose, arms at 45 degrees") gave chubby characters arms only ~20 degrees out (posecheck
+# arm_gap 0.25-0.40, upper arm still fused in the mesh), so it asks for a wide, slightly lowered T-pose; `make
+# --rig-ready` meshes the variant with the best arm_gap (lib/posecheck.py) and warns when none is >= 0.70.
+template_rig = "{prompt}, standing in a strict T-pose for rigging: both arms raised and stretched straight out horizontally at shoulder height like airplane wings, elbows straight, palms down, a large empty space under each arm from the armpit to the hand, nothing touching the body, legs straight and apart with a gap between them, facing the camera. Single character, whole body in frame, centered, front view, symmetrical, isolated on a seamless plain light gray background, soft even neutral studio lighting, floating, no shadow, no contact shadow, no text, no watermark, highly detailed, sharp focus"
+negative_rig = "arms at sides, arms touching the body, hands on hips, arms crossed, hands together, holding an object, legs together, legs crossed, sitting, three-quarter view, side view, multiple characters, cropped, cut off, background scenery, gradient background, floor, drop shadow, text, watermark, blurry"
+
+# Background cutout before image→mesh (engines with own_cutout skip it).
+# 2026-09-26 spike: the colour key (hy3d-mcp cutout.py) smeared on Z-Image's
+# graded grey backdrop (7-28% partial alpha; clean is < 1%) and Hunyuan built
+# the backdrop into a wall behind the knight. "vision" = Apple's on-device
+# foreground mask (bin/vision-cutout); untested until the GPU is next free.
+[cutout]
+method = "vision"            # vision | colorkey  (vision default since the 2026-09-26 retest)
+max_partial_pct = 5.0        # warn above this (vision leaves ~2-3% soft edge): the key is smeared, expect backdrop geometry
+
+[image_models.zimage-turbo]
+# Pre-quantized 4-bit mflux pack, read from the shared Hugging Face cache.
+cmd = ["mflux-generate-z-image-turbo", "--model", "filipstrand/Z-Image-Turbo-mflux-4bit",
+       "--base-model", "z-image-turbo", "--steps", "9",
+       "--prompt", "{prompt}", "--seed", "{seed}", "--width", "{width}", "--height", "{height}",
+       "--output", "{out}"]
+license = "Apache-2.0"
+role = "economical: seconds per image, reroll concepts freely"
+
+[image_models."qwen-2.1"]
+# 33 GB bf16 in the shared HF cache, quantized to 8-bit on load.
+cmd = ["mflux-generate-qwen-2.1", "-q", "8",
+       "--prompt", "{prompt}", "--negative-prompt", "{negative}", "--seed", "{seed}",
+       "--width", "{width}", "--height", "{height}", "--output", "{out}"]
+license = "Qwen Research License (model card, checked 2026-10-02): not for anything sold"
+role = "max quality: #1 open-weights leaderboard (2026-09)"
+
+[engines.hy3d]
+# Hunyuan3D MLX-Swift port. Shape "small" = Hunyuan3D-2mini (0.6B), paint
+# "large" = Hunyuan3D-2.1 PBR. This pairing is hy3d-mcp's production default.
+# There is no 2.1 shape model in this port.
+cwd   = "{hy3d_repo}"
+draft = ["{hy3d}", "shape", "{image}", "-o", "{out}", "--weights", "{hy3d_weights}/shape-small", "--seed", "{seed}"]
+full  = ["{hy3d}", "generate", "{image}", "-o", "{out}",
+         "--shape-weights", "{hy3d_weights}/shape-small", "--paint-weights", "{hy3d_weights}/paint-large",
+         "--paint-model", "pbr", "--tex", "2048", "--seed", "{seed}"]
+license = "Tencent Hunyuan community licence (territorial limits); Swift code MIT"
+textured_draft = false
+max_seconds = 1200
+role = "default: best textures measured; Hunyuan licence excludes EU/UK/South Korea"
+
+[engines.hy3d-large]
+# Same, with shape "large" = Hunyuan3D-2.0-turbo (8-step) for the geometry.
+cwd   = "{hy3d_repo}"
+draft = ["{hy3d}", "shape", "{image}", "-o", "{out}", "--weights", "{hy3d_weights}/shape-large", "--seed", "{seed}"]
+full  = ["{hy3d}", "generate", "{image}", "-o", "{out}",
+         "--shape-weights", "{hy3d_weights}/shape-large", "--paint-weights", "{hy3d_weights}/paint-large",
+         "--paint-model", "pbr", "--tex", "2048", "--seed", "{seed}"]
+license = "Tencent Hunyuan community licence (territorial limits); Swift code MIT"
+textured_draft = false
+max_seconds = 1200
+role = "same paint, 2.0-turbo shape; no visible gain, slower"
+
+[engines.pixal3d]
+# Pixal3D (TencentARC, SIGGRAPH 2026, MIT) through ComfyUI core's native nodes,
+# driven headless by lib/comfy3d.py. Pixel-aligned: the front matches the
+# concept image. Includes BiRefNet cutout, MoGe camera, remesh, decimate,
+# UV and bake. Licence-clean for games sold anywhere (2026-09-26 research).
+draft = ["{comfy_py}", "{lib}/comfy3d.py", "{image}", "{out}", "--model", "pixal3d", "--seed", "{seed}", "--faces", "100000"]
+full  = ["{comfy_py}", "{lib}/comfy3d.py", "{image}", "{out}", "--model", "pixal3d", "--seed", "{seed}", "--faces", "300000"]
+license = "MIT (Pixal3D, TRELLIS.2 VAEs, BiRefNet repack); DINOv3 repack under Meta's DINOv3 licence"
+textured_draft = true
+max_seconds = 2700
+role = "for games sold anywhere (MIT models + Meta DINOv3 licence); good shape, darker textures"
+own_cutout = true   # BiRefNet inside the workflow; skip m3d's colour-key cutout
+port = 8189
+
+[engines.trellis2]
+# TRELLIS.2 4B through the same ComfyUI template (its switch set to TRELLIS.2).
+draft = ["{comfy_py}", "{lib}/comfy3d.py", "{image}", "{out}", "--model", "trellis2", "--seed", "{seed}", "--faces", "100000"]
+full  = ["{comfy_py}", "{lib}/comfy3d.py", "{image}", "{out}", "--model", "trellis2", "--seed", "{seed}", "--faces", "300000"]
+license = "MIT (weights); DINOv3 repack under Meta's DINOv3 licence"
+textured_draft = true
+max_seconds = 2700
+role = "MIT alternative; weakest textures measured"
+own_cutout = true
+
+[engines.hunyuan21]
+# Real Hunyuan3D 2.1 shape (3.3B) + 2.1 PBR paint through mlx-serve (Homebrew tap
+# ddalcu/mlx-serve, 2026-10-02), driven by lib/mlxserve3d.py.
+draft = ["{worker_py}", "{lib}/mlxserve3d.py", "{image}", "{out}", "--no-texture", "--seed", "{seed}"]
+full  = ["{worker_py}", "{lib}/mlxserve3d.py", "{image}", "{out}", "--seed", "{seed}"]
+license = "Tencent Hunyuan 3D 2.1 community licence (excludes EU/UK/South Korea)"
+textured_draft = false
+max_seconds = 2700
+role = "real Hunyuan 2.1 shape + 2.1 paint via mlx-serve; ~145 s"
+port = 11234
+
+[engines.hunyuan21-rig]
+# Same, plus UniRig auto-rigging (skeleton + skin weights in the GLB; UniRig is MIT).
+draft = ["{worker_py}", "{lib}/mlxserve3d.py", "{image}", "{out}", "--no-texture", "--rig", "--seed", "{seed}"]
+full  = ["{worker_py}", "{lib}/mlxserve3d.py", "{image}", "{out}", "--rig", "--seed", "{seed}"]
+license = "Hunyuan 2.1 community licence; UniRig MIT"
+textured_draft = false
+max_seconds = 2700
+role = "NOT WORKING YET: mlx-serve 26.10.1 ignores rig (2026-10-02); fails loudly instead"
+port = 11234
+
+# ---------- m3d rig: skeleton + skin weights into a textured GLB ----------
+# Output is <stem>-rigged.glb with <stem>-rigged.roles.json beside it (bone -> role,
+# the contract motion.py and retarget.py consume). gpu = true rows go through the GPU
+# guard and the GPU lock; the others are CPU-only Blender or numpy work.
+[riggers.skintokens]
+# SkinTokens / TokenRig (VAST, MIT weights) through skin-tokens.cpp (Apache-2.0, GGML,
+# Metal via --device auto). lib/skintokens.py runs the CLI and grafts the skeleton and
+# weights back onto the textured input (the port drops UVs and materials). Then bin/m3d
+# runs lib/roles.py (roles sidecar, node extras, Mixamo name map) and lib/weightfix.py
+# (limb weight that bled onto the trunk goes back; --no-weightfix skips it).
+cmd = ["{worker_py}", "{lib}/skintokens.py", "{glb}", "{out}", "--device", "{device}", "--seed", "{seed}"]
+env = { SKINTOKENS_CLI = "{skintokens_cli}", SKINTOKENS_MODEL_DIR = "{skintokens_weights}", M3D_BLENDER = "{blender}" }
+license = "SkinTokens weights MIT (VAST); skin-tokens.cpp Apache-2.0"
+role = "default: AI auto-rig for humanoids and anything near its training set (template-biased: humanoid/VRoid/Mixamo; odd skeletons on objects); Metal, ~30-50 s"
+gpu = true
+max_seconds = 1800
+cap_gib = 12
+
+[riggers.puppet]
+# Deterministic rig from a small pivot spec (specs/puppet/*.json, or --spec auto): hard
+# weights for rigid parts, smooth for soft ones, squash/stretch shape keys, roles on every
+# bone. The non-humanoid path (lamp, teapot, kite). Blender headless, CPU.
+cmd = ["{blender}", "-b", "--factory-startup", "--python", "{lib}/puppet.py", "--", "{glb}", "{out}", "--spec", "{spec}"]
+license = "local code (GPL Blender runs it)"
+role = "deterministic puppet rig from a spec or a heuristic: objects and robots, anything SkinTokens gets wrong"
+gpu = false
+max_seconds = 900
+cap_gib = 16
+
+# ---------- m3d animate: clips for a rigged GLB ----------
+# One GLB per clip (<stem>.<clip>.glb; Apple's USDZ route keeps only the first glTF
+# animation per file) plus <stem>.all.glb. Both rows run on the CPU.
+[motion.procedural]
+# lib/motion.py: idle, hop, look, wave, spin, wobble, sleep keyed on bone roles, so one
+# preset animates a puppet rig, a SkinTokens rig or a Mixamo-named humanoid alike.
+cmd = ["{blender}", "-b", "--factory-startup", "--python", "{lib}/motion.py", "--", "{glb}", "{out}",
+       "--clips", "{clips}", "--fps", "{fps}", "--seconds", "{seconds}"]
+license = "local code"
+role = "procedural looping clips for any rig with roles; --clips"
+max_seconds = 900
+cap_gib = 16
+default_seconds = 2
+
+[motion.momask]
+# MoMask (CVPR 2024) humanoid text-to-motion on the CPU -> BVH (22-joint HumanML3D
+# skeleton, Mixamo names) -> lib/retarget.py onto the rig through its sidecar's Mixamo map.
+# Bipeds only: the role tagger must have found legs, arms, body (summary "biped").
+cmd = ["{worker_py}", "{lib}/momask.py", "{prompt}", "{out}", "--seconds", "{seconds}"]
+env = { MOMASK_HOME = "{momask_home}", MOMASK_REPO = "{momask_repo}" }
+license = "MIT code (EricGuo5513/momask-codes); trained on HumanML3D/AMASS data: not for anything sold"
+role = "humanoid text-to-motion (--text), CPU, ~5 s per 4 s clip; research data licence, not for sale"
+max_seconds = 900
+cap_gib = 8
+default_seconds = 4
+
+# Post-processing presets for `m3d post` (lib/ai2game.py, Blender headless).
+# Apple budgets (research 2026-09-26): Shared Space < 250k triangles and < 250
+# draw calls for the whole scene, ~100k in view; a Full Space doubles that.
+# One asset should take a fraction of that, hence 50k for visionOS.
+# mode: decimate (keeps silhouette) | voxel (watertight first) | quadriflow (quads, flaky headless)
+[post.game]
+use_for = "game assets: 20k tris + LOD1/LOD2"
+faces = 20000
+texture = 2048
+mode = "decimate"
+lods = "0.5,0.25"
+
+[post.visionos]
+use_for = "Vision Pro objects in a scene: 50k tris + LOD1"
+faces = 50000
+texture = 2048
+mode = "decimate"
+lods = "0.5"
+
+[post.hero]
+use_for = "one showcase object, best quality (close-up on Vision Pro): 150k tris, 4096 textures"
+faces = 150000
+texture = 4096
+mode = "decimate"
+lods = "0.5,0.25"

@@ -1,0 +1,13 @@
+bench/.slot-start
+bin/vision-cutout
+__pycache__/
+*.log
+
+viewer/.build/
+viewer/M3DViewer.xcodeproj/
+viewer/Models/*.usdz
+viewer/Info.plist
+.DS_Store
+bench/*.events.jsonl
+viewer/.build-device/
+bench/*.progress.stdout

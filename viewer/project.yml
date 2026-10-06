@@ -1,0 +1,26 @@
+# m3d viewer: renders USDZs with RealityKit in the visionOS simulator so m3d's
+# outputs are checked by Apple's own renderer, not just `usdchecker` (2026-10-02).
+# Generated into an Xcode project by viewer/render.sh; never hand-edit the .xcodeproj.
+name: M3DViewer
+options:
+  bundleIdPrefix: local.m3d
+targets:
+  M3DViewer:
+    type: application
+    platform: visionOS
+    deploymentTarget: "27.0"
+    sources:
+      - Sources
+      - path: Models
+        type: folder
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: m3d viewer
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+          UIApplicationPreferredDefaultSceneSessionRole: UIWindowSceneSessionRoleVolumetricApplication
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.m3d.viewer
+        SWIFT_VERSION: "6.0"

@@ -1,0 +1,4 @@
+# Passed to ComfyUI as --extra-model-paths-config by lib/comfy3d.py.
+m3d:
+  base_path: ..   # relative to this file's folder (ComfyUI resolves it so): the m3d checkout
+  custom_nodes: comfy_nodes

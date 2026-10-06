@@ -1,0 +1,1298 @@
+#!/usr/bin/env python3
+"""m3d — local, Meshy-style prompt → image → textured 3D mesh on this Mac.
+
+usage:
+  m3d make "<prompt>" | image.png  [-o DIR] [--draft] [--engine E] [--image-model M]
+                                   [--seed N] [--variants N] [--post PRESET] [--dry-run] [--json]
+  m3d concept "<prompt>"           [--variants N] [--image-model M] [--seed N]   (images only)
+  m3d mesh image.png               [--draft] [--engine E] [--post PRESET]         (image → GLB [+ USDZ])
+  m3d post model.glb               [--preset game|visionos|hero] [--faces N]      (reduce, re-bake, LODs, GLB + USDZ)
+  m3d rig model.glb                [--engine skintokens|puppet] [--spec auto|spec.json] [--no-weightfix] [--check]
+                                                                                   (skeleton + skin weights + bone roles)
+  m3d animate rigged.glb           [--clips idle,hop,…] [--text "…"] [--bvh clip.bvh] [--usdz] [--check]
+                                                                                   (one GLB [+ USDZ] per clip)
+  m3d models                       list image models, engines, riggers and motion models from m3d.toml
+  m3d gpu                          say whether the GPU is free, and who holds it
+
+Every model and engine is a row in ../m3d.toml; this script only reads it.
+--force skips the GPU guard. Nothing else overrides it.
+
+Why this shape (2026-09-26): Meshy's CLI (`meshy make`) is cloud-only. Its
+interface is the part worth copying: one verb, --dry-run with a plan, JSON for
+agents, files on disk, distinct exit codes. Underneath, every local open
+3D model is image-conditioned, so text-to-3D is text → concept image →
+cutout → mesh, the same split Meshy's own preview/refine stages suggest.
+
+Exit codes: 0 ok, 2 usage, 3 GPU busy, 4 a stage failed, 5 bad concept (cutout refused).
+"""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CFG = tomllib.loads((ROOT / "m3d.toml").read_text())
+# m3d.toml [paths] may use $M3D_ROOT (this checkout), $M3D_REPOS (where the upstream engine clones live,
+# default ~/repos), $M3D_OUT (outputs, default ~/3d/m3d), $M3D_BLENDER (default: blender on PATH, else
+# Homebrew's) or any other environment variable, so the registry works on any Mac without edits.
+os.environ.setdefault("M3D_ROOT", str(ROOT))
+os.environ.setdefault("M3D_REPOS", str(Path.home() / "repos"))
+os.environ.setdefault("M3D_OUT", str(Path.home() / "3d" / "m3d"))
+os.environ.setdefault("M3D_BLENDER", shutil.which("blender") or "/opt/homebrew/bin/blender")
+P = {k: os.path.expandvars(os.path.expanduser(v)) for k, v in CFG["paths"].items()}
+RUNS = ROOT / "bench" / "runs.tsv"
+LOCK = Path.home() / ".cache" / "m3d" / "gpu.lock"
+JSON_OUT = False
+
+
+def log(msg):
+    # Always stderr, also under --json: stdout carries the JSON, and an agent's bash
+    # tool shows stderr. Hiding these hid the [yield] lines from pi (live test 2026-10-02).
+    print(msg, file=sys.stderr, flush=True)
+
+
+def die(code, msg, **extra):
+    if JSON_OUT:
+        print(json.dumps({"status": "FAILED", "exit": code, "error": msg, **extra}))
+    else:
+        print(f"m3d: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------- GPU guard ----------
+# This Mac runs one GPU job at a time: the video rig measured a 9x slowdown
+# with an LLM resident during a render (2026-09-23), and ds4 at 150k ctx wires
+# ~107 GB, which leaves no room for a 30-40 GB paint pass (2026-09-26).
+BUSY_PROCS = ["ltx-2-mlx", "ltx_pipelines", "story.sh", "redo.sh", "run-queue.sh",
+              "mflux-generate", "hy3d", "comfy3d.py", "mlxserve3d.py", "main.py", "mlx-serve",
+              "skintokens-cli"]  # the SkinTokens rigger runs on Metal (m3d rig, 2026-10-02)
+# Language-model engines. llama-swap's /running shows its own children, but an engine
+# started with `model <target>` (ds4-serve) is only visible as a process (film rig, 2026-09-23).
+LLM_PROCS = ["ds4-server", "llama-server"]
+# A venv's python shows up in ps under its real interpreter path, so ComfyUI
+# is matched by its arguments, not by "ComfyUI/.venv" (missed, 2026-09-26).
+
+
+# Programs that never touch the GPU, however their arguments read.
+NOT_GPU = {"gh", "git", "grep", "rg", "ugrep", "tail", "head", "less", "more", "cat", "vim", "nvim",
+           "curl", "ssh", "pgrep", "ps", "lsof", "sed", "awk", "open", "code", "kb", "find", "ls"}
+
+
+def is_gpu_job(cmd):
+    """The GPU program a command line runs, or None. Matches the program being run
+    (the first few non-flag argv items, so `python -m ltx_pipelines`, `bash story.sh`
+    and `/usr/bin/time -l hy3d generate` are found), never a word anywhere in the
+    arguments: on 2026-10-02 another agent's `gh api repos/ddalcu/mlx-serve/...`
+    was counted as a GPU job and blocked a pi --yield-llm call."""
+    argv = cmd.split()
+    if not argv:
+        return None
+    first = os.path.basename(argv[0])
+    # shells only mention GPU jobs in their text (a watchdog loop did, 2026-09-26)
+    if first in NOT_GPU or (first in ("sh", "bash", "zsh") and "-c" in argv[1:3]):
+        return None
+    toks = [t for t in argv[:6] if not t.startswith("-")][:4]
+    for t in toks:
+        b = os.path.basename(t)
+        for p in BUSY_PROCS + LLM_PROCS:
+            name = p.split()[0]
+            if b == name or (name.endswith("-generate") and b.startswith(name)) \
+                    or (b.startswith(name) and name in ("ltx_pipelines",)) \
+                    or (name == "ltx-2-mlx" and "/ltx-2-mlx/" in t):
+                if name == "main.py" and "--port" not in argv:
+                    continue
+                if name == "hy3d" and not any(w in argv for w in ("generate", "shape", "paint")):
+                    continue
+                return name
+    return None
+
+
+def gpu_holders():
+    holders = []
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8090/running", timeout=2) as r:
+            for m in json.load(r).get("running", []):
+                holders.append(f"llama-swap has {m.get('model')} loaded ({m.get('state')})")
+    except Exception:
+        pass
+    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    rows = {}
+    for line in ps.splitlines():
+        pid, ppid, cmd = line.strip().split(None, 2) + [""] * (3 - len(line.strip().split(None, 2)))
+        rows[int(pid)] = (int(ppid), cmd)
+    # Skip this process and every ancestor: a wrapper shell whose command text
+    # names comfy3d.py matched the guard and blocked its own job (2026-09-26).
+    mine, p_ = set(), os.getpid()
+    while p_ in rows and p_ not in mine and p_ > 1:
+        mine.add(p_); p_ = rows[p_][0]
+    for pid, (_, cmd) in rows.items():
+        if pid in mine or is_gpu_job(cmd) is None:
+            continue
+        holders.append(f"pid {pid}: {cmd[:100]}")
+    return holders
+
+
+# ---------- the Mac's GPU hold (2026-10-04; optional, see github.com/mthomas100/local-rig) ----------
+# One lock for the GPU, shared with the film rig and the owner's `hold on`, kept by the hold gate in front of
+# llama-swap (:8090). An m3d command's first GPU stage queues for it (behind a render it waits instead of failing),
+# the gate lets the LLM's calls in flight finish and unloads it, and every agent's next model call waits until
+# this m3d run ends (the hold ends with the process). Inside a hold (HOLD_ID: a script that already holds the GPU)
+# m3d joins it. This is what --yield-llm did for llama-swap, now for every caller; --yield-llm still stops a
+# `model <target>` engine, which the gate does not control. With no gate answering, the guard decides alone.
+HOLD = {}
+
+
+def take_gpu_hold(force):
+    if HOLD or force or os.environ.get("HOLD_ID") or not shutil.which("hold"):
+        return
+    reason = " ".join(a for a in sys.argv[1:4] if not a.startswith("-"))[:80]
+    r = subprocess.run(["hold", "acquire", "--pid", str(os.getpid()), "--kind", "m3d", "--reason", reason, "--json"],
+                       stdout=subprocess.PIPE, text=True)  # its progress lines go to our stderr
+    if r.returncode == 3:
+        log("[hold] no hold gate answers on :8090; the GPU guard alone decides")
+        return
+    if r.returncode != 0:
+        die(3, f"could not take the GPU hold (hold acquire exited {r.returncode}); see `hold status`")
+    v = json.loads(r.stdout)
+    HOLD.update(id=v["id"], nested=bool(v.get("nested")))
+    os.environ["HOLD_ID"] = v["id"]
+    log(f"[hold] GPU hold {v['id']} {'joined' if v.get('nested') else 'granted'}: model calls wait until this m3d run ends")
+    if not v.get("nested"):
+        import atexit
+        atexit.register(lambda: subprocess.run(["hold", "release", v["id"]], capture_output=True))
+
+
+def guard(force, yield_llm=False):
+    take_gpu_hold(force)
+    holders = gpu_holders()
+    if holders and yield_llm:
+        holders = yield_language_model(holders)
+    if holders and not force:
+        die(3, "GPU busy, refusing to start (use --force only if you know it is safe):\n  "
+            + "\n  ".join(holders)
+            + ("" if yield_llm else "\n  If the only holder is the language model you are running as, "
+               "pass --yield-llm (it is unloaded now and reloads on your next request)."),
+            holders=holders)
+
+
+# ---------- yielding the GPU from the calling agent's own language model ----------
+# Ported from the film rig's render_and_wait (a sibling video project, 2026-09-23):
+# a local model in pi and a 30-60 GB generation stage cannot share this Mac (qwen38 is a
+# 177 GB MoE that takes what memory it can), so the turn alternates: unload, wait until
+# memory settles, run, and let the model come back on the agent's next request. Opt-in
+# only: unloading is right when the caller owns the model, never on someone else's.
+SWAP = "http://127.0.0.1:8090"
+DS4_DIR = Path(os.environ.get("M3D_DS4_DIR", Path.home() / "repos" / "ds4"))  # a ds4-serve checkout, if any
+WIRED_MAX_GB = 40
+_restart_target = None
+YIELD = {}  # what --yield-llm did, returned in the JSON result
+
+
+def _wired_gb():
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    wired = int(re.search(r"Pages wired down:\s+(\d+)", out).group(1))
+    return round(page * wired / 1e9, 1)
+
+
+def _memory_free_pct():
+    r = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True)
+    return int(r.stdout.strip() or 0)
+
+
+def _swap_running():
+    try:
+        with urllib.request.urlopen(f"{SWAP}/running", timeout=5) as r:
+            return [m.get("model") for m in json.load(r).get("running", [])]
+    except Exception:
+        return []
+
+
+def _llm_procs():
+    ps = subprocess.run(["pgrep", "-fl", "|".join(LLM_PROCS)], capture_output=True, text=True).stdout
+    return [l for l in ps.splitlines() if l.strip()]
+
+
+def _restart_engine():
+    """atexit: bring back a ds4-serve engine stopped for this run, success or failure."""
+    global _restart_target
+    t, _restart_target = _restart_target, None
+    if not t:
+        return
+    log(f"[yield] restarting the language model with `model {t}`")
+    r = subprocess.run([str(DS4_DIR / "model"), t, "--yes"], cwd=DS4_DIR, capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"[yield] RESTART FAILED (exit {r.returncode}); run `model {t}` in a terminal. "
+            + (r.stderr or r.stdout).strip()[-300:])
+
+
+def yield_language_model(holders):
+    """Unload the calling agent's model, wait for memory to settle, return what still holds the GPU."""
+    global _restart_target
+    import atexit
+    others = [h for h in holders if not h.startswith("llama-swap has ") and not any(p in h for p in LLM_PROCS)]
+    if others:
+        return holders  # a render, ComfyUI or another m3d: never yield into that
+    t0 = time.time()
+    if _swap_running():
+        YIELD.update(unloaded=_swap_running(), via="llama-swap /unload")
+        log(f"[yield] unloading {', '.join(_swap_running())} from llama-swap (it reloads on the next request)")
+        try:
+            urllib.request.urlopen(f"{SWAP}/unload", timeout=300).read()
+        except Exception as e:
+            log(f"[yield] unload request failed: {e}")
+    elif _llm_procs() and (DS4_DIR / "model").exists():
+        st = subprocess.run([str(DS4_DIR / "model"), "status", "--porcelain"], cwd=DS4_DIR,
+                            capture_output=True, text=True).stdout
+        target = dict(l.split("=", 1) for l in st.splitlines() if "=" in l).get("target", "").strip()
+        log(f"[yield] stopping the ds4-serve engine {target or '(unknown)'} with `model stop`")
+        subprocess.run([str(DS4_DIR / "model"), "stop", "--yes"], cwd=DS4_DIR, capture_output=True, text=True)
+        YIELD.update(unloaded=[target or "ds4-serve engine"], via="model stop",
+                     restarts_after=target or None)
+        if target:
+            _restart_target = target
+            atexit.register(_restart_engine)
+    for _ in range(40):  # up to ~7 minutes, as in the film rig
+        running, procs, wired = _swap_running(), _llm_procs(), _wired_gb()
+        if not running and not procs and wired < WIRED_MAX_GB:
+            free = _memory_free_pct()
+            YIELD.update(settle_seconds=round(time.time() - t0, 1), wired_gb=wired, memory_free_pct=free)
+            log(f"[yield] GPU clear after {time.time() - t0:.0f}s (wired {wired} GB, {free}% memory free)"
+                + ("  ⚠ another process holds memory; expect swapping" if free < 45 else ""))
+            return []
+        log(f"[yield] settling: running={running} engines={len(procs)} wired={wired} GB")
+        time.sleep(10)
+    return gpu_holders() or [f"memory did not settle: {_wired_gb()} GB still wired"]
+
+
+# ---------- helpers ----------
+def slug(text):
+    # same rule as lib/momask.py's slugify, so `animate --text` can name the BVH it expects
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:48].rstrip("-") or "model"
+
+
+def fill(parts, **kw):
+    vals = {**P, **{k: str(v) for k, v in kw.items()}}
+    return [re.sub(r"\{(\w+)\}", lambda m: vals.get(m.group(1), m.group(0)), p) for p in parts]
+
+
+def fill_env(env, **kw):
+    """A row's `env` table with the same placeholders filled (riggers point their worker at
+    the CLI and weights named in [paths])."""
+    return {k: fill([v], **kw)[0] for k, v in (env or {}).items()} or None
+
+
+def record(stage, model, seconds, peak_gb, out, ok):
+    new = not RUNS.exists()
+    RUNS.parent.mkdir(parents=True, exist_ok=True)
+    with RUNS.open("a") as f:
+        if new:
+            f.write("when\tstage\tmodel\tseconds\tpeak_gb\tok\toutput\n")
+        f.write(f"{dt.datetime.now().isoformat(timespec='seconds')}\t{stage}\t{model}\t"
+                f"{seconds:.1f}\t{peak_gb:.1f}\t{int(ok)}\t{out}\n")
+
+
+# Blender exits 0 after a Python traceback, so a stage only counts when its worker
+# printed its closing marker line (ai2game.py's M3D_POST, 2026-09-26; every rig and
+# animate worker since 2026-10-02). Keyed on the stage name before its first "-".
+MARKERS = {"post": "M3D_POST", "rig": "M3D_RIG", "roles": "M3D_ROLES", "weightfix": "M3D_WEIGHTFIX",
+           "anim": "M3D_ANIM", "motion": "M3D_MOTION", "retarget": "M3D_RETARGET", "animcheck": "M3D_ANIMCHECK", "rigstress": "M3D_RIGSTRESS", "posecheck": "M3D_POSECHECK"}
+MEMGUARD = ROOT / "bin" / "memguard"
+
+
+def run_stage(stage, model, cmd, out, cwd=None, env=None, dry=False, max_s=None, watch=(), cap=None, soft=False):
+    """Run one stage under /usr/bin/time -l so every run leaves wall time and
+    peak memory footprint in bench/runs.tsv (the README table is built from it).
+
+    Stall check (2026-10-01): a Pixal3D job sat silent for ~12 h holding the GPU
+    (2026-09-26/27). A stage is stopped when neither its own log nor any `watch`
+    file (e.g. ComfyUI's server log) has changed for [limits] stall_seconds, or
+    when it passes `max_s`. Stopping sends SIGTERM to the whole process group
+    (comfy3d turns that into a clean server shutdown); SIGKILL only if it is
+    still alive two minutes later.
+
+    `cap` (GiB) wraps the command in bin/memguard, which kills it when its RSS
+    passes the cap or system free memory drops under 15% (the 2026-10-02 jetsam
+    incident). The stage then fails with memguard's line in its log. `soft`:
+    a failure is returned as {"error": …} instead of ending the run (a checker
+    that crashes must not throw away the clips it was checking)."""
+    if cap:
+        cmd = [str(MEMGUARD), str(cap), *map(str, cmd)]
+    if dry:
+        log(f"  would run: {' '.join(map(str, cmd))}" + (f"   (cwd {cwd})" if cwd else ""))
+        return {"stage": stage, "model": model, "cmd": list(map(str, cmd)), "output": str(out)}
+    stall_s = CFG.get("limits", {}).get("stall_seconds", 900)
+    log(f"[{stage}] {model} …")
+    t0 = time.time()
+    full_env = {**os.environ, **(env or {})}
+    logf = Path(out).with_suffix(Path(out).suffix + ".log")
+    logf.parent.mkdir(parents=True, exist_ok=True)
+    reason = None
+    with open(logf, "w") as lf:
+        lf.write(f"$ {' '.join(map(str, cmd))}\n\n")
+        lf.flush()
+        p = subprocess.Popen(["/usr/bin/time", "-l", *map(str, cmd)], cwd=cwd, env=full_env,
+                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+        while p.poll() is None:
+            time.sleep(5)
+            now = time.time()
+            last = max([logf.stat().st_mtime] + [Path(w).stat().st_mtime for w in watch if Path(w).exists()])
+            if now - last > stall_s:
+                reason = f"no output for {stall_s}s (stalled)"
+            elif max_s and now - t0 > max_s:
+                reason = f"passed its {max_s}s limit"
+            if reason:
+                log(f"[{stage}] stopping: {reason}")
+                os.killpg(p.pid, signal.SIGTERM)
+                try:
+                    p.wait(120)
+                except subprocess.TimeoutExpired:
+                    log(f"[{stage}] still alive 120 s after SIGTERM; SIGKILL")
+                    os.killpg(p.pid, signal.SIGKILL)
+                    p.wait()
+                break
+    secs = time.time() - t0
+    text = logf.read_text(errors="replace")
+    # "peak memory footprint" is the waited process's own; for a wrapper (memguard, a
+    # script that spawns a venv child) it is a few MB, while "maximum resident set
+    # size" carries the largest child's RSS (lib/momask.py's note, 2026-10-02).
+    m = re.search(r"(\d+)\s+peak memory footprint", text)
+    peak = int(m.group(1)) / 1e9 if m else 0.0
+    m = re.search(r"(\d+)\s+maximum resident set size", text)
+    if m and peak < 0.1:
+        peak = int(m.group(1)) / 1e9
+    ok = reason is None and p.returncode == 0 and Path(out).exists()
+    marker = MARKERS.get(stage.split("-")[0])
+    if marker and not re.search(rf"^{marker}\b", text, re.M):
+        ok = False
+    record(stage, model, secs, peak, out, ok)
+    if not ok:
+        # the worker's last lines, without /usr/bin/time's statistics block
+        tail = re.split(r"^\s+[\d.]+ real\s+[\d.]+ user", text, maxsplit=1, flags=re.M)[0].strip()[-1500:]
+        why = f"{stage} failed after {secs:.0f}s ({reason or f'exit {p.returncode}'}); log: {logf}"
+        if soft:
+            log(f"[{stage}] {why}\n" + tail[-600:])
+            return {"stage": stage, "model": model, "seconds": round(secs, 1), "peak_gb": round(peak, 1),
+                    "output": str(out), "error": why, "log": str(logf)}
+        die(4, why + "\n" + tail, stage=stage, log=str(logf))
+    log(f"[{stage}] done in {secs:.0f}s, peak {peak:.1f} GB → {out}")
+    return {"stage": stage, "model": model, "seconds": round(secs, 1), "peak_gb": round(peak, 1),
+            "output": str(out)}
+
+
+def port_open(port):
+    return subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                          capture_output=True).returncode == 0
+
+
+def worker(name, *args):
+    p = subprocess.run([P["worker_py"], f"{P['workers']}/{name}.py", *map(str, args)],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        return {"error": (p.stderr or p.stdout).strip()[-800:] or f"{name} produced no output"}
+
+
+# ---------- stages ----------
+def concept(prompt, outdir, model_key, seed, variants, dry, rig_ready=False):
+    im = CFG["image_models"][model_key]
+    c = CFG["concept"]
+    full_prompt = c["template_rig" if rig_ready else "template"].format(prompt=prompt)
+    negative = c["negative_rig" if rig_ready else "negative"]
+    outs = []
+    for i in range(variants):
+        s = seed + i
+        out = outdir / f"concept-{model_key}-s{s}.png"
+        cmd = fill(im["cmd"], prompt=full_prompt, negative=negative, seed=s, out=out,
+                   width=CFG["defaults"]["width"], height=CFG["defaults"]["height"])
+        outs.append(run_stage("concept", model_key, cmd, out, dry=dry,
+                              max_s=CFG.get("limits", {}).get("concept_seconds", 600)))
+    return outs
+
+
+def posecheck(images, outdir, dry):
+    """--rig-ready: cut out every concept (Apple Vision) and rank them by how clearly the arms and legs stand apart
+    from the body in the silhouette (lib/posecheck.py: arm_gap, leg_gap). 2026-10-03, the teddy: arms drawn against
+    the body score 0.00 and mesh fused; a 0.40 concept still meshed with the upper arm fused; ok >= 0.70.
+    Returns {"ranked": [...], "best": png, "ok": bool}; soft, so a failure never loses the concepts."""
+    cuts = []
+    for im in images:
+        out = outdir / (Path(im).stem + "-rgba.png")
+        if not dry:
+            subprocess.run([str(ROOT / "bin" / "vision-cutout"), str(im), str(out)], capture_output=True, text=True)
+        if dry or out.exists():
+            cuts.append(str(out))
+    out = outdir / "posecheck.json"
+    res = run_stage("posecheck", "posecheck", [P["worker_py"], f"{P['lib']}/posecheck.py", *cuts, "--out", out], out,
+                    dry=dry, cap=CAP_PYTHON, max_s=300, soft=True)
+    if dry or "error" in res:
+        return res
+    try:
+        rep = json.loads(out.read_text())
+        for r in rep["ranked"]:                         # map each cutout back to its concept PNG
+            r["concept"] = str(Path(r["image"]).with_name(Path(r["image"]).name.replace("-rgba.png", ".png")))
+        best = rep["ranked"][0]
+        out.write_text(json.dumps(rep, indent=1))
+        ok = best.get(rep.get("ok_metric", "arm_gap"), 0) >= rep["ok_threshold"]
+        log("[posecheck] " + ", ".join(f"{Path(r['concept']).stem}: notch {r.get('notch', 0):.3f} arm_gap {r['arm_gap']:.2f} leg_gap {r['leg_gap']:.2f}"
+                                       for r in rep["ranked"]))
+        if not ok:
+            log(f"[posecheck] WARNING: no concept has its arms clear of the body (best notch {best.get('notch', 0):.3f} < "
+                f"{rep['ok_threshold']}); the mesh will fuse them. Try more --variants or another --seed.")
+        res.update(ranked=rep["ranked"], best=best["concept"], ok=ok, report=str(out))
+    except Exception as e:
+        res.update(error=f"posecheck report unreadable: {e}")
+    return res
+
+
+def alpha_partial_pct(png):
+    """Share of pixels with partial alpha: the key-quality measure (< 1% is clean)."""
+    code = ("import sys,numpy as n;from PIL import Image;"
+            "a=n.asarray(Image.open(sys.argv[1]).convert('RGBA'))[...,3];"
+            "print(round(float(((a>0)&(a<255)).mean()*100),2))")
+    p = subprocess.run([P["worker_py"], "-c", code, str(png)], capture_output=True, text=True)
+    try:
+        return float(p.stdout.strip())
+    except ValueError:
+        return None
+
+
+def cutout(image, outdir, dry):
+    method = CFG.get("cutout", {}).get("method", "colorkey")
+    out = outdir / (Path(image).stem + "-rgba.png")
+    if dry:
+        log(f"  would cut out background ({method}): {image} → {out}")
+        return {"stage": "cutout", "method": method, "output": str(out)}
+    if method == "vision":
+        p = subprocess.run([str(ROOT / "bin" / "vision-cutout"), str(image), str(out)],
+                           capture_output=True, text=True)
+        try:
+            r = json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception:
+            r = {"error": (p.stderr or p.stdout).strip()[-800:]}
+    else:
+        r = worker("cutout", image, out)
+    if "error" in r:
+        die(5, f"cutout ({method}) refused {image}: {r['error']}\n"
+            "  Regenerate the concept on a flat plain background.", stage="cutout")
+    partial = r.get("partial_pct", alpha_partial_pct(out))
+    warn = partial is not None and partial > CFG.get("cutout", {}).get("max_partial_pct", 3.0)
+    log(f"[cutout] {method}: opaque {r.get('opaque_pct')}%, partial {partial}%"
+        + ("  ⚠ smeared key: expect backdrop geometry; reroll the concept, or set [cutout] method = 'vision'" if warn else "")
+        + f" → {out}")
+    return {"stage": "cutout", "method": method, **r, "partial_pct": partial, "output": str(out)}
+
+
+def mesh(image, outdir, engine_key, draft, seed, dry):
+    e = CFG["engines"][engine_key]
+    tier = "draft" if draft else "full"
+    out = outdir / f"{Path(image).stem.removesuffix('-rgba')}-{engine_key}-{tier}.glb"
+    cmd = fill(e[tier], image=image, out=out, seed=seed)
+    cwd = fill([e["cwd"]])[0] if "cwd" in e else None
+    watch = [str(out) + ".comfy.log", str(out) + ".mlxserve.log"]
+    port = e.get("port")
+    try:
+        res = run_stage(f"mesh-{tier}", engine_key, cmd, out, cwd=cwd, env=e.get("env"), dry=dry,
+                        max_s=e.get("max_seconds"), watch=watch)
+    finally:
+        # A ComfyUI server left behind held ~70 GB after a GPU hand-back (2026-09-26);
+        # engines that start a server (ComfyUI, mlx-serve) name their port in m3d.toml.
+        if port and not dry and port_open(port):
+            log(f"[mesh] WARNING: {engine_key}'s server is still listening on {port}; "
+                "stop it before handing the GPU back")
+    if not dry:
+        n = worker("normals", out)  # the engines omit NORMAL; Godot/RealityKit then light it flat
+        res["normals"] = n.get("normals_added", n.get("warning", n.get("error")))
+    return res
+
+
+def glb_to_usdz(glb):
+    """GLB → USDZ with Apple's own tools (usdextract, then usdzip --arkitAsset),
+    checked with `usdchecker --arkit`. Replaced Blender's USD export on 2026-10-02:
+    Blender's files passed the checker but rendered solid black in RealityKit;
+    Apple's conversion of the same GLB rendered correctly (viewer/render.sh)."""
+    import tempfile
+    usdz = Path(glb).with_suffix(".usdz")
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["usdextract", str(glb), "-o", tmp], check=True, capture_output=True)
+        root = next(Path(tmp).glob("*.usd*"))
+        # usdextract stamps 1 time code per second, so RealityKit played every clip at one
+        # sample a second (2026-10-02); lib/usdretime.py rescales the layer to 30 codes/s.
+        subprocess.run([sys.executable, str(ROOT / "lib" / "usdretime.py"), str(root), "30"],
+                       check=True, capture_output=True)
+        # usdextract names joints by their full glTF node path ("n10/n8"); RealityKit refuses a
+        # skeleton whose root joint is not a single token and silently drops the skin, so
+        # only baked node transforms ever played (found 2026-10-03). lib/usdjointfix.py
+        # strips the non-joint prefix from every joint token.
+        subprocess.run([sys.executable, str(ROOT / "lib" / "usdjointfix.py"), str(root)],
+                       check=True, capture_output=True)
+        # The root-motion mover leaves the GLB's inverse bind matrices in the pre-mover space,
+        # so in USD bindTransforms != chained restTransforms and RealityKit over-rotates every
+        # chain (a straight-arm wave). lib/usdbindfix.py sets bind := chained rest and shifts
+        # the points to match (no-op for plain layouts). Found 2026-10-03.
+        subprocess.run([P["worker_py"], str(ROOT / "lib" / "usdbindfix.py"), str(root)],
+                       check=True, capture_output=True)
+        subprocess.run(["usdzip", "--arkitAsset", root.name, str(usdz.resolve())], cwd=tmp,
+                       check=True, capture_output=True)
+    chk = subprocess.run(["xcrun", "usdchecker", "--arkit", str(usdz)], capture_output=True, text=True)
+    ok = "Success" in (chk.stdout + chk.stderr)
+    log(f"[usdz] {usdz.name}: {'usdchecker ok' if ok else 'usdchecker FAILED'}")
+    return {"usdz": str(usdz), "usdchecker": ok}
+
+
+def post(glb, preset, faces, dry, metal=False, glass="", glass_alpha=0.45):
+    """Re-bake a raw AI mesh into a light, game/visionOS-ready asset (lib/ai2game.py):
+    reduce, re-UV, bake base colour/roughness/metallic/normal from the dense mesh,
+    pack ORM, LODs, GLB + USDZ. The bake runs on the CPU unless --metal is given
+    (2026-10-01: an automatic Metal choice ran a 129 s bake on the GPU after it had
+    been handed back, because the guard missed an orphaned server)."""
+    pr = CFG["post"][preset]
+    faces = faces or pr["faces"]
+    outdir = Path(glb).with_name(Path(glb).stem + f"-{preset}" + ("-glass" if glass else ""))
+    device = "METAL" if metal and not dry else "CPU"
+    cmd = [P["blender"], "-b", "--factory-startup", "--python", str(ROOT / "lib" / "ai2game.py"), "--",
+           str(glb), str(outdir), "--faces", str(faces), "--tex", str(pr["texture"]),
+           "--mode", pr.get("mode", "decimate"), "--device", device, "--lods", pr.get("lods", "0.5,0.25")]
+    if glass:
+        cmd += ["--glass", glass, "--glass-alpha", str(glass_alpha)]
+    if not dry:
+        outdir.mkdir(parents=True, exist_ok=True)
+    name = Path(glb).stem
+    res = run_stage(f"post-{preset}", f"blender-{device.lower()}", cmd, outdir / f"{name}_LOD0.glb", dry=dry,
+                    max_s=CFG.get("limits", {}).get("post_seconds", 1800))
+    if dry:
+        log(f"  would convert each LOD GLB to USDZ with usdextract + usdzip --arkitAsset")
+        return res
+    res["usdz"] = [glb_to_usdz(g) for g in sorted(outdir.glob(f"{name}_LOD*.glb"))]
+    if not all(u["usdchecker"] for u in res["usdz"]):
+        die(4, f"USDZ conversion failed usdchecker in {outdir}", stage="usdz")
+    return res
+
+
+# ---------- rig and animate (2026-10-02, the rig/animate plan) ----------
+# Contract: the rigged GLB is <stem>-rigged.glb with <stem>-rigged.roles.json beside it
+# (bone -> role; roles.py's wrapper form or puppet.py's flat form). motion.py and
+# retarget.py find the sidecar by that name, so every rigger's output is moved into it.
+CAP_BLENDER = CFG.get("limits", {}).get("cap_blender_gib", 16)
+CAP_PYTHON = CFG.get("limits", {}).get("cap_python_gib", 8)
+PROCEDURAL_CLIPS = ["idle", "hop", "look", "wave", "spin", "wobble", "sleep"]
+
+
+def read_roles(sidecar):
+    """(roles {bone: role}, summary) from either sidecar form; ({}, None) when unreadable."""
+    try:
+        d = json.loads(Path(sidecar).read_text())
+    except Exception:
+        return {}, None
+    if isinstance(d.get("roles"), dict):
+        return d["roles"], d.get("summary")
+    return {k: v for k, v in d.items() if isinstance(v, str)}, None
+
+
+def roles_summary(sidecar):
+    roles, summary = read_roles(sidecar)
+    counts = {}
+    for r in roles.values():
+        counts[r] = counts.get(r, 0) + 1
+    return {"bones": len(roles), "summary": summary, "counts": dict(sorted(counts.items()))}
+
+
+def rigplot(glb, out, dry):
+    """lib/rigplot.py: joints and bones drawn over the mesh, front and side, plus the
+    hierarchy and weight summary in its log. The "look at the rig" step; always run."""
+    res = run_stage("rigplot", "rigplot", [P["worker_py"], f"{P['lib']}/rigplot.py", glb, out], out,
+                    dry=dry, cap=CAP_PYTHON, max_s=300)
+    if not dry:
+        m = re.search(r"^joints=(\d+) bones=(\d+) verts=(\d+) tris=(\d+)", Path(str(out) + ".log").read_text(), re.M)
+        if m:
+            res.update(joints=int(m.group(1)), bones=int(m.group(2)), verts=int(m.group(3)), tris=int(m.group(4)))
+    return res
+
+
+def rig(glb, outdir, engine_key, spec, weightfix, check, seed, device, from_raw, dry, rip=True):
+    """One rigger row ([riggers.*]) -> <outdir>/<stem>-rigged.glb + .roles.json + rigplot PNG.
+    skintokens: CLI + graft (lib/skintokens.py) -> roles.py (sidecar, node extras, Mixamo
+    map) -> weightfix.py (default on) -> final name. puppet: lib/puppet.py writes the
+    final files itself (roles included)."""
+    r = CFG["riggers"][engine_key]
+    glb = Path(glb).resolve()
+    stem = glb.stem
+    final = outdir / f"{stem}-rigged.glb"
+    sidecar = outdir / f"{stem}-rigged.roles.json"
+    steps = []
+    if engine_key == "puppet":
+        cmd = fill(r["cmd"], glb=glb, out=outdir, spec=spec, seed=seed) + (["--check"] if check else [])
+        steps.append(run_stage("rig", "puppet", cmd, final, env=fill_env(r.get("env")), dry=dry,
+                               max_s=r.get("max_seconds"), cap=r.get("cap_gib", CAP_BLENDER)))
+        if check and not dry:
+            steps[-1]["check_renders"] = [str(outdir / f) for f in ("check-rest.png", "check-posed.png")]
+    else:
+        stage_dir = outdir / engine_key
+        staged = stage_dir / f"{stem}-rigged.glb"
+        cmd = fill(r["cmd"], glb=glb, out=stage_dir, device=device, seed=seed)
+        model = f"{engine_key}-{device}"
+        if from_raw:
+            cmd += ["--from-raw", str(Path(from_raw).resolve())]
+            model = f"{engine_key}-graft"
+        steps.append(run_stage("rig", model, cmd, staged, env=fill_env(r.get("env")), dry=dry,
+                               max_s=r.get("max_seconds"), cap=r.get("cap_gib", CAP_PYTHON)))
+        # roles: sidecar beside the staged GLB, node extras written in place, the Mixamo map
+        # always (so --text can say precisely why a non-biped is refused)
+        cmd = [P["worker_py"], f"{P['lib']}/roles.py", staged, "--in-place", "--humanoid-names"]
+        if check:
+            cmd += ["--plot", stage_dir / f"{stem}-roles.png"]
+        steps.append(run_stage("roles", "roles", cmd, stage_dir / f"{stem}-rigged.roles.json", dry=dry,
+                               cap=CAP_PYTHON, max_s=600))
+        if weightfix:
+            # --roles: the sidecar decides limbs vs trunk (without it the lamp's torso top was
+            # mistaken for neck). --rip on bipeds: generated humanoids fuse hands to hips
+            # (knight: ~140 triangles per arm); no weighting frees them (2026-10-02).
+            staged_sidecar = stage_dir / f"{stem}-rigged.roles.json"
+            cmd = [P["worker_py"], f"{P['lib']}/weightfix.py", staged, final, "--roles", staged_sidecar]
+            biped = not dry and staged_sidecar.exists() and "biped" in (read_roles(staged_sidecar)[1] or "")
+            if biped and rip:
+                cmd.append("--rip")
+            steps.append(run_stage("weightfix", "weightfix" + ("-rip" if biped and rip else ""), cmd, final,
+                                   dry=dry, cap=CAP_PYTHON, max_s=600))
+        elif dry:
+            log(f"  would copy {staged} → {final}")
+        else:
+            shutil.copyfile(staged, final)
+        if dry:
+            log(f"  would copy {stage_dir / f'{stem}-rigged.roles.json'} → {sidecar}")
+        else:
+            shutil.copyfile(stage_dir / f"{stem}-rigged.roles.json", sidecar)
+    plot = rigplot(final, outdir / f"{stem}-rigged-rigplot.png", dry)
+    steps.append(plot)
+    stress = rigstress(final, dry)
+    steps.append(stress)
+    res = {"engine": engine_key, "glb": str(final), "roles": str(sidecar), "plot": str(plot["output"]),
+           "weightfix": bool(weightfix and engine_key != "puppet"), "steps": steps}
+    if not dry:
+        res["joints"] = plot.get("joints")
+        res["roles_summary"] = roles_summary(sidecar)
+        res["stress"] = {k: stress.get(k) for k in ("verdict", "web_area_max", "web_sheet_max", "advice", "report")}
+    return res
+
+
+def rigstress(glb, dry):
+    """lib/rigstress.py: pose each limb (arms up and out, legs forward) in numpy and measure skin pulled into
+    sheets (animcheck's web metric). A limb fused to the body in the mesh fails here, before any clip is made
+    (2026-10-03, the pi teddy test). Soft: a crash leaves the rig and reports verdict "error"."""
+    out = Path(str(Path(glb).with_suffix("")) + "-rigstress.json")
+    cmd = [P["worker_py"], f"{P['lib']}/rigstress.py", glb, "--out", str(out.with_suffix(""))]
+    res = run_stage("rigstress", "rigstress", cmd, out, dry=dry, cap=CAP_PYTHON, max_s=300, soft=True)
+    if dry:
+        return res
+    try:
+        rep = json.loads(out.read_text())
+        res.update(verdict=rep["verdict"], web_area_max=rep["web_area_max"], web_sheet_max=rep["web_sheet_max"],
+                   advice=rep.get("advice"), report=str(out), poses=rep["poses"])
+        if rep["verdict"] != "ok":
+            log(f"[rig] WARNING stress test {rep['verdict']}: {rep.get('advice')}")
+    except Exception as e:
+        res.update(verdict="error", advice=f"rigstress report unreadable: {e}", report=None)
+    return res
+
+
+def clip_glbs(stem, animdir, names):
+    return [str(animdir / f"{stem}.{n}.glb") for n in names]
+
+
+def retarget(rigged, bvh, animdir, sidecar, clip, fps, in_place, check, dry):
+    """lib/retarget.py in Blender: a Mixamo-named BVH onto the rig through the sidecar's
+    Mixamo map -> <stem>.<clip>.glb (one animation)."""
+    cmd = [P["blender"], "-b", "--factory-startup", "--python", f"{P['lib']}/retarget.py", "--",
+           rigged, bvh, animdir, "--map", sidecar, "--clip-name", clip, "--fps", fps]
+    cmd += ["--in-place"] if in_place else []
+    cmd += ["--check"] if check else []
+    out = animdir / f"{Path(rigged).stem}.{clip}.glb"
+    res = run_stage("retarget", "retarget", cmd, out, dry=dry, cap=CAP_BLENDER, max_s=900)
+    if check and not dry:
+        res["sheet"] = str(animdir / f"{Path(rigged).stem}.{clip}-sheet.png")
+    return res
+
+
+def animcheck(clip_glb, dry):
+    """lib/animcheck.py with a Blender frame render: penetration, stretch, web (skin pulled into sheets), bleed,
+    floor sink and a contact sheet with the worst frame marked. Verdict ok | warn | fail."""
+    prefix = str(Path(clip_glb).with_suffix("")) + "-animcheck"   # animcheck.py's own default
+    out = Path(prefix + ".json")
+    cmd = [P["worker_py"], f"{P['lib']}/animcheck.py", clip_glb, "--render", "--out", prefix]
+    res = run_stage("animcheck", "animcheck", cmd, out, dry=dry, cap=CAP_PYTHON, max_s=900, soft=True)
+    if dry:
+        return res
+    if "error" in res:   # the checker itself crashed: the clip stays, its verdict is "error"
+        res.update(clip=str(clip_glb), verdict="error", reasons=[res["error"]], report=None, sheet=None)
+        return res
+    m = re.search(r"^M3D_ANIMCHECK (.*)$", Path(str(out) + ".log").read_text(errors="replace"), re.M)
+    stats = dict(kv.split("=", 1) for kv in (m.group(1).split() if m else []) if "=" in kv)
+    try:
+        rep = json.loads(out.read_text())
+        res["reasons"] = rep.get("reasons", [])
+        res.update({k: rep.get(k) for k in ("web_area", "web_sheet", "web_sheet_bones") if k in rep})
+    except Exception:
+        pass
+    res.update(clip=str(clip_glb), verdict=stats.get("verdict", "unknown"), report=str(out),
+               sheet=prefix + "-sheet.png",
+               # a rig with no trunk-owned skin prints nan for penetration/bleed: null in JSON, never NaN
+               **{k: (None if v == "nan" else float(v)) for k, v in stats.items()
+                  if k in ("penetration_max", "stretch_p99", "bleed")})
+    return res
+
+
+def summarize(outdir, mesh_res=None, post_res=None, t0=None, **extra):
+    """Top-level fields an agent can quote as they are: full paths, wall time, yield."""
+    out = {"dir": str(Path(outdir).resolve())}
+    if mesh_res and mesh_res.get("output"):
+        out["raw_glb"] = str(Path(mesh_res["output"]).resolve())
+        out["glb"] = out["raw_glb"]
+    if post_res and post_res.get("output"):
+        out["glb"] = str(Path(post_res["output"]).resolve())
+        u = [x["usdz"] for x in post_res.get("usdz", [])]
+        if u:
+            out["usdz"] = str(Path(u[0]).resolve())
+            out["all_usdz"] = [str(Path(x).resolve()) for x in u]
+    if t0:
+        out["wall_seconds"] = round(time.time() - t0, 1)
+    if YIELD:
+        out["yield"] = dict(YIELD)
+    if HOLD:
+        out["hold"] = dict(HOLD)
+    out.update(extra)
+    return out
+
+
+def contact_sheet(images, out):
+    """One labelled grid of concept images, so an agent reviews a round in one look
+    (live test 2026-10-02: one image per turn cost ~20 s each on qwen38)."""
+    code = ("import sys;from PIL import Image,ImageDraw\n"
+            "fs=sys.argv[2:];W=512;n=len(fs);c=min(n,4);r=(n+c-1)//c\n"
+            "s=Image.new('RGB',(W*c,W*r),'white');d=ImageDraw.Draw(s)\n"
+            "for i,f in enumerate(fs):\n"
+            " x,y=(i%c)*W,(i//c)*W;s.paste(Image.open(f).convert('RGB').resize((W,W)),(x,y))\n"
+            " d.rectangle((x,y,x+W,y+26),fill='black');d.text((x+6,y+6),f.rsplit('/',1)[-1],fill='white')\n"
+            "s.save(sys.argv[1])")
+    subprocess.run([P["worker_py"], "-c", code, str(out), *map(str, images)], check=False)
+    return str(Path(out).resolve()) if Path(out).exists() else None
+
+
+# ---------- commands ----------
+def cmd_make(a):
+    t0 = time.time()
+    src = a.input
+    is_image = Path(src).is_file()
+    name = Path(src).stem if is_image else slug(src)
+    outdir = Path(a.output or Path(P["out"]) / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{name}")
+    plan = (["image"] if is_image else [f"text→image ({a.image_model}×{a.variants})"]) + \
+           ([] if CFG["engines"][a.engine].get("own_cutout") else ["cutout"]) + [f"image→mesh ({a.engine}, {'draft' if a.draft else 'full'})"] + \
+           ([f"post ({a.post})"] if a.post else [])
+    log(f"Plan: {' → '.join(plan)} → {outdir}  (local, 0 credits)")
+    if not a.dry_run:
+        guard(a.force, a.yield_llm)
+        outdir.mkdir(parents=True, exist_ok=True)
+        LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lk = open(LOCK, "w")
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            die(3, "another m3d job holds the GPU lock")
+    steps = []
+    if is_image:
+        image = src
+    else:
+        cs = concept(src, outdir, a.image_model, a.seed, a.variants, a.dry_run, a.rig_ready)
+        steps += cs
+        image = cs[0].get("output", str(outdir / "concept.png"))
+        if a.rig_ready:
+            pc = posecheck([c.get("output") for c in cs], outdir, a.dry_run)
+            steps.append(pc)
+            if pc.get("best"):
+                image = pc["best"]
+                log(f"--rig-ready: meshing the concept with the clearest arms and legs: {image}")
+        elif a.variants > 1 and not a.dry_run:
+            log(f"{a.variants} concepts written; meshing the first. Re-run `m3d mesh <png>` on another.")
+    if CFG["engines"][a.engine].get("own_cutout"):
+        mesh_in = image
+    else:
+        cut = cutout(image, outdir, a.dry_run)
+        steps.append(cut)
+        mesh_in = cut["output"]
+    m = mesh(mesh_in, outdir, a.engine, a.draft, a.seed, a.dry_run)
+    steps.append(m)
+    pr = None
+    if a.post:
+        pr = post(m.get("output", outdir / "model.glb"), a.post, None, a.dry_run, a.metal, a.glass, a.glass_alpha)
+        steps.append(pr)
+    result = {"status": "PLANNED" if a.dry_run else "SUCCEEDED", "plan": plan,
+              **summarize(outdir, m, pr, None if a.dry_run else t0), "steps": steps}
+    if not a.dry_run:
+        (outdir / "run.json").write_text(json.dumps({"input": src, **result}, indent=2))
+    if JSON_OUT:
+        print(json.dumps(result))
+    elif not a.dry_run:
+        print(f"✓ {result.get('usdz') or result.get('glb')}  ({result.get('wall_seconds')} s)")
+
+
+def cmd_concept(a):
+    t0 = time.time()
+    outdir = Path(a.output or Path(P["out"]) / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{slug(a.prompt)}")
+    if not a.dry_run:
+        guard(a.force, a.yield_llm)
+        outdir.mkdir(parents=True, exist_ok=True)
+    r = concept(a.prompt, outdir, a.image_model, a.seed, a.variants, a.dry_run, a.rig_ready)
+    images = [str(Path(x["output"]).resolve()) for x in r]
+    sheet = None
+    if len(r) > 1 and not a.dry_run:
+        sheet = contact_sheet(images, outdir / f"concept-sheet-{a.image_model}.png")
+    pose = None
+    if a.rig_ready:
+        pc = posecheck(images, outdir, a.dry_run); r = r + [pc]
+        if pc.get("ranked"):
+            pose = {"best": pc["best"], "ok": pc["ok"], "ranked": [{k: x.get(k) for k in ("concept", "notch", "arm_gap", "leg_gap")}
+                                                                    for x in pc["ranked"]]}
+    res = summarize(outdir, t0=None if a.dry_run else t0, images=images, sheet=sheet, steps=r,
+                    **({"pose": pose} if pose else {}))
+    print(json.dumps(res) if JSON_OUT else "\n".join(images + ([f"sheet: {sheet}"] if sheet else [])
+                                                      + ([f"best pose: {pose['best']}"] if pose else [])))
+
+
+def cmd_mesh(a):
+    t0 = time.time()
+    outdir = Path(a.output or Path(a.image).resolve().parent)
+    if not a.dry_run:
+        guard(a.force, a.yield_llm)
+    img = a.image
+    if not a.no_cutout and not CFG["engines"][a.engine].get("own_cutout"):
+        img = cutout(img, outdir, a.dry_run)["output"]
+    m = mesh(img, outdir, a.engine, a.draft, a.seed, a.dry_run)
+    pr = post(m.get("output"), a.post, None, a.dry_run, a.metal, a.glass, a.glass_alpha) if a.post and not a.draft else None
+    res = summarize(outdir, m, pr, None if a.dry_run else t0, mesh=m, post=pr)
+    if JSON_OUT:
+        print(json.dumps(res))
+    else:
+        print(res.get("usdz") or res.get("glb", ""))
+
+
+def cmd_post(a):
+    r = post(a.glb, a.preset, a.faces, a.dry_run, a.metal, a.glass, a.glass_alpha)
+    print(json.dumps(r) if JSON_OUT else r.get("output", ""))
+
+
+def cmd_rig(a):
+    t0 = time.time()
+    glb = Path(a.glb)
+    if not glb.is_file() or glb.suffix.lower() != ".glb":
+        die(2, f"rig needs an existing .glb: {glb}")
+    r = CFG["riggers"][a.engine]
+    outdir = Path(a.output or glb.resolve().parent / "rig")
+    device = "cpu" if a.cpu else "metal"
+    if a.spec != "auto":
+        if not Path(a.spec).is_file():
+            die(2, f"--spec file not found: {a.spec} (or use --spec auto)")
+        a.spec = str(Path(a.spec).resolve())   # Blender's cwd is not ours
+    plan = [f"rig ({a.engine}" + (f", spec {a.spec}" if a.engine == "puppet" else f", {device}"
+            + (", from raw" if a.from_raw else "")) + ")"]
+    if a.engine != "puppet":
+        plan += ["roles"] + (["weightfix"] if not a.no_weightfix else [])
+    plan += ["rigplot", "rigstress"]
+    log(f"Plan: {' → '.join(plan)} → {outdir}  (local, 0 credits; "
+        + ("GPU: Metal" if r.get("gpu") and not a.from_raw else "CPU only") + ")")
+    if not a.dry_run:
+        if r.get("gpu") and not a.from_raw:
+            guard(a.force, a.yield_llm)
+            LOCK.parent.mkdir(parents=True, exist_ok=True)
+            lk = open(LOCK, "w")
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                die(3, "another m3d job holds the GPU lock")
+        outdir.mkdir(parents=True, exist_ok=True)
+    res = rig(glb, outdir, a.engine, a.spec, not a.no_weightfix, a.check, a.seed, device, a.from_raw, a.dry_run, not a.no_rip)
+    result = {"status": "PLANNED" if a.dry_run else "SUCCEEDED", "plan": plan,
+              **summarize(outdir, t0=None if a.dry_run else t0), **res}
+    if not a.dry_run:
+        (outdir / "rig.json").write_text(json.dumps({"input": str(glb.resolve()), **result}, indent=2))
+        log(f"[rig] look at the rig: {result['plot']}")
+    if JSON_OUT:
+        print(json.dumps(result))
+    elif not a.dry_run:
+        rs = result.get("roles_summary") or {}
+        print(f"✓ {result['glb']}  ({result['joints']} joints, {rs.get('summary') or 'roles'}: "
+              f"{', '.join(f'{k}×{v}' for k, v in (rs.get('counts') or {}).items())}; {result['wall_seconds']} s)\n"
+              f"  roles: {result['roles']}\n  plot:  {result['plot']}")
+
+
+def cmd_animate(a):
+    t0 = time.time()
+    rigged = Path(a.glb)
+    if not rigged.is_file() or rigged.suffix.lower() != ".glb":
+        die(2, f"animate needs an existing rigged .glb: {rigged}")
+    rigged = rigged.resolve()
+    stem = rigged.stem
+    sidecar = rigged.with_suffix(".roles.json")
+    outdir = Path(a.output or rigged.parent)
+    animdir = outdir / "anim"
+    clips = [c.strip() for c in a.clips.split(",") if c.strip()] if a.clips else []
+    bad = [c for c in clips if c not in PROCEDURAL_CLIPS]
+    if bad:
+        die(2, f"unknown clips {bad}; known: {', '.join(PROCEDURAL_CLIPS)}")
+    if not clips and not a.text and not a.bvh:
+        clips = list(PROCEDURAL_CLIPS)
+    if getattr(a, "yield_llm", False):
+        # 2026-10-03 live test: pi passed --yield-llm here, saw nothing happen and spent 4 dummy GPU renders to
+        # force an unload, because the old bin/memguard killed Blender whenever a resident LLM left < 15% free.
+        # memguard now kills only a job that is itself big; animate's Blender/MoMask (~1 GB) runs beside the model.
+        log("[yield] animate is CPU-only (Blender, MoMask on CPU): nothing to unload; your model stays loaded")
+        YIELD.update(unloaded=[], via="none (CPU-only stage)")
+    if not sidecar.exists():
+        log(f"[animate] WARNING: no roles sidecar at {sidecar}; motion.py falls back to node extras and bone names")
+    roles, summary = read_roles(sidecar)
+    if a.text or a.bvh:
+        try:
+            has_map = bool(json.loads(sidecar.read_text()).get("mixamo"))
+        except Exception:
+            has_map = False
+        if not has_map or not (summary or "").startswith("biped"):
+            die(2, f"--text/--bvh need a biped rig with a Mixamo name map in {sidecar.name} "
+                   f"(this rig: {summary or 'no summary'}, {'with' if has_map else 'no'} map). "
+                   "Humanoid motion cannot drive it; use --clips idle,hop,look,wave,spin,wobble,sleep instead.")
+    plan = ([f"procedural ({','.join(clips)})"] if clips else []) \
+        + ([f"momask text→BVH ({a.seconds or CFG['motion']['momask'].get('default_seconds', 4)} s) → retarget"] if a.text else []) \
+        + ([f"retarget {Path(a.bvh).name}"] if a.bvh else []) \
+        + (["usdz per clip"] if a.usdz else []) + (["animcheck per clip"] if a.check else [])
+    log(f"Plan: {' → '.join(plan)} → {animdir}  (local, CPU only, 0 credits)")
+    steps, made = [], []   # made: [(clip name, glb path)]
+    if not a.dry_run:
+        animdir.mkdir(parents=True, exist_ok=True)
+    if clips:
+        m = CFG["motion"]["procedural"]
+        # motion.py takes the puppet's .blend when it sits beside the GLB (shape keys and
+        # custom properties exactly as puppet.py left them); otherwise the GLB itself
+        blend = rigged.with_suffix(".blend")
+        src = blend if blend.exists() else rigged
+        cmd = fill(m["cmd"], glb=src, out=animdir, clips=",".join(clips), fps=a.fps,
+                   seconds=a.seconds or m.get("default_seconds", 2)) + (["--check"] if a.check else [])
+        steps.append(run_stage("anim", "procedural", cmd, animdir / f"{stem}.all.glb", env=fill_env(m.get("env")),
+                               dry=a.dry_run, max_s=m.get("max_seconds"), cap=m.get("cap_gib", CAP_BLENDER)))
+        if a.check and not a.dry_run:
+            steps[-1]["check_renders"] = [str(animdir / f"check-{c}.png") for c in clips]
+        made += list(zip(clips, clip_glbs(stem, animdir, clips)))
+    if a.text:
+        m = CFG["motion"]["momask"]
+        mdir = animdir / "momask"
+        name = slug(a.text)
+        cmd = fill(m["cmd"], prompt=a.text, out=mdir, seconds=a.seconds or m.get("default_seconds", 4))
+        if a.seed is not None:
+            cmd += ["--seed", str(a.seed)]
+        steps.append(run_stage("motion", "momask", cmd, mdir / f"{name}.bvh", env=fill_env(m.get("env")),
+                               dry=a.dry_run, max_s=m.get("max_seconds"), cap=m.get("cap_gib", CAP_PYTHON)))
+        steps.append(retarget(rigged, mdir / f"{name}.bvh", animdir, sidecar, name, a.fps, a.in_place, a.check, a.dry_run))
+        made.append((name, steps[-1]["output"]))
+    if a.bvh:
+        name = slug(Path(a.bvh).stem)
+        steps.append(retarget(rigged, Path(a.bvh).resolve(), animdir, sidecar, name, a.fps, a.in_place, a.check, a.dry_run))
+        made.append((name, steps[-1]["output"]))
+    result = {"status": "PLANNED" if a.dry_run else "SUCCEEDED", "plan": plan, "dir": str(animdir.resolve()),
+              "rig": str(rigged), "clips": {n: str(g) for n, g in made}, "fps": a.fps}
+    if clips:
+        result["all_clips_glb"] = str(animdir / f"{stem}.all.glb")
+    if a.usdz:
+        if a.dry_run:
+            log("  would convert each clip GLB to USDZ with usdextract + usdzip --arkitAsset (one per clip: "
+                "Apple's converter keeps only the first animation of a file)")
+        else:
+            us = {n: glb_to_usdz(g) for n, g in made}
+            result["usdz"] = {n: u["usdz"] for n, u in us.items()}
+            if not all(u["usdchecker"] for u in us.values()):
+                die(4, f"USDZ conversion failed usdchecker in {animdir}", stage="usdz")
+    worst = None
+    if a.check:
+        checks = [(n, animcheck(g, a.dry_run)) for n, g in made]
+        steps += [c for _, c in checks]
+        if not a.dry_run:
+            order = {"ok": 0, "warn": 1, "fail": 2, "error": 2, "unknown": 2}
+            worst = max((c["verdict"] for _, c in checks), key=lambda v: order.get(v, 2), default="ok")
+            result["animcheck"] = {n: {k: c.get(k) for k in
+                                       ("verdict", "penetration_max", "stretch_p99", "web_area", "web_sheet", "bleed", "reasons", "sheet", "report")}
+                                   for n, c in checks}
+            result["verdict"] = worst
+    if not a.dry_run:
+        result["wall_seconds"] = round(time.time() - t0, 1)
+        if YIELD:
+            result["yield"] = dict(YIELD)
+        if HOLD:
+            result["hold"] = dict(HOLD)
+    result["steps"] = steps
+    if not a.dry_run:
+        (animdir / "animate.json").write_text(json.dumps({"input": str(rigged), **result}, indent=2))
+    if worst in ("fail", "error", "unknown") and not a.allow_fail:
+        result["status"] = "CHECK_FAILED"
+        result["exit"] = 4
+        if JSON_OUT:
+            print(json.dumps(result))
+        else:
+            for n, c in result["animcheck"].items():
+                print(f"  {n}: {c['verdict']}  {'; '.join(c.get('reasons') or [])}\n    sheet {c['sheet']}", file=sys.stderr)
+            print(f"m3d: animcheck verdict {worst} (see the sheets above; --allow-fail to keep exit 0)", file=sys.stderr)
+        sys.exit(4)
+    if JSON_OUT:
+        print(json.dumps(result))
+    elif not a.dry_run:
+        for n, g in made:
+            line = f"✓ {n}: {result.get('usdz', {}).get(n) or g}"
+            if a.check:
+                c = result["animcheck"][n]
+                line += f"   [{c['verdict']}]" + (f" {'; '.join(c['reasons'])}" if c.get("reasons") else "")
+            print(line)
+        if a.check:
+            print(f"  animcheck sheets: {animdir}/*-animcheck-sheet.png  (verdict {worst})")
+        print(f"  ({result['wall_seconds']} s)")
+
+
+def cmd_models(a):
+    rows = {"image_models": {k: {"role": v.get("role"), "license": v.get("license")}
+                             for k, v in CFG["image_models"].items()},
+            "engines": {k: {"role": v.get("role"), "license": v.get("license"),
+                            "textured_draft": v.get("textured_draft")}
+                        for k, v in CFG["engines"].items()},
+            "riggers": {k: {"role": v.get("role"), "license": v.get("license"), "gpu": v.get("gpu", False)}
+                        for k, v in CFG.get("riggers", {}).items()},
+            "motion": {k: {"role": v.get("role"), "license": v.get("license"),
+                           "clips": PROCEDURAL_CLIPS if k == "procedural" else "--text"}
+                       for k, v in CFG.get("motion", {}).items()},
+            "post_presets": {k: {"use_for": v.get("use_for"), "faces": v["faces"], "texture": v["texture"]}
+                             for k, v in CFG["post"].items()},
+            "cutout": CFG.get("cutout", {}).get("method"),
+            "defaults": CFG["defaults"],
+            "output_root": P["out"]}
+    print(json.dumps(rows, indent=2))
+
+
+def cmd_gpu(a):
+    h = gpu_holders()
+    gate = ""  # the Mac's GPU hold (2026-10-04): who holds it, what is queued
+    if shutil.which("hold"):
+        gate = (subprocess.run(["hold", "status"], capture_output=True, text=True).stdout.strip().splitlines() or [""])[0]
+    if JSON_OUT:
+        print(json.dumps({"free": not h, "holders": h, **({"hold": gate} if gate else {})}))
+    else:
+        print("GPU free" if not h else "GPU busy:\n  " + "\n  ".join(h))
+        if gate:
+            print(f"hold gate: {gate}")
+    sys.exit(0 if not h else 3)
+
+
+RECIPES = """\
+RECIPES (intent -> command). Run `m3d gpu` first: exit 3 means another job holds
+the shared GPU; wait or ask its owner, never --force. A local model (pi) whose
+own model is the only holder adds --yield-llm (unload, run, reload on next turn).
+Every GPU command also takes the Mac's GPU hold (`hold status`, 2026-10-04): behind
+a render it waits its turn, and the LLM is unloaded first and comes back after.
+
+  Vision Pro object, best quality:
+      m3d concept "<object>" --variants 4     # ~20 s each; look at the one contact sheet
+                                              # it prints and pick the cleanest (one object, no shadow)
+      m3d mesh <chosen.png> --post hero       # ~5 min; 150k tris, 4096 textures
+  Vision Pro object, normal (several objects in one scene):
+      m3d make "<object>" --post visionos     # ~7 min end to end; 50k tris
+  Game asset:
+      m3d make "<object>" --post game         # 20k tris + LOD1 and LOD2
+  Game sold in the EU, UK or South Korea: add --engine pixal3d (MIT models plus Meta's
+      DINOv3 licence for the encoder; the default Hunyuan licence excludes those regions)
+  Quick shape check before spending minutes:   m3d make "<object>" --draft   # ~15 s
+  From your own picture:   m3d make photo.png --post visionos   (one object, plain background)
+  Re-export an existing model:   m3d post model.glb --preset hero
+  Object with glass (lantern, bottle, window, potion, jar, lens): add --glass <tint> to the
+      command with --post, e.g. --glass green. Engines paint glass opaque without it;
+      the glass must be tinted in the concept (it is found by colour).
+  See the plan only:   add --dry-run (add --json for machine-readable output)
+
+  Rig and animate a finished model (local; CPU except the SkinTokens rigger, which uses Metal):
+      m3d rig <name>_LOD0.glb                             # SkinTokens AI auto-rig (~1 min): humanoids and the like
+      m3d rig <name>_LOD0.glb --engine puppet --spec specs/puppet/<thing>.json   # deterministic rig for objects
+                                                          # and robots (--spec auto guesses); writes rig/<name>_LOD0-rigged.glb
+                                                          # + .roles.json; LOOK at the rigplot PNG it prints
+      m3d animate rig/<name>_LOD0-rigged.glb --clips idle,wave,hop --usdz --check    # procedural clips, any rig
+      m3d animate rig/<name>_LOD0-rigged.glb --text "a person waves hello" --usdz --check   # biped rigs only:
+                                                          # MoMask text-to-motion (CPU) retargeted onto the rig
+      --check writes an animcheck sheet per clip and a verdict (ok | warn | fail; exit 4 on fail unless
+      --allow-fail): LOOK at the worst frame on the sheet. One GLB (and USDZ) per clip, because Apple's USDZ
+      converter keeps only the first animation in a file; RealityKit assembles the clips at runtime.
+
+PROMPTS: describe one object, its materials and, when the shape matters, its
+construction, e.g. "a six-sided brass ship's lantern with flat green glass panes and a
+ring on top" (without "flat panes" Z-Image drew globe lanterns, 2026-10-02). m3d adds the background, lighting and framing words itself;
+do not add a scene, background or lighting.
+
+OUTPUT: a new folder {out}/<time>-<prompt>/ with the concept PNG, the cutout,
+<name>-<engine>-full.glb (raw, dense) and, with --post, <name>-<preset>/ holding
+<name>_LOD0.glb and <name>_LOD0.usdz (use these), lower LODs and texture PNGs.
+`make` writes run.json there. With --json every command prints top-level "glb",
+"usdz", "dir", "wall_seconds" (and "yield", "sheet" where they apply) as full paths.
+USDZ is for Vision Pro / iPhone / Reality Composer Pro; GLB for game engines.
+`rig` writes <glb's dir>/rig/<name>-rigged.glb, <name>-rigged.roles.json, the rigplot PNG
+and rig.json ("glb", "roles", "plot", "joints", "roles_summary"); `animate` writes
+<rig dir>/anim/<name>-rigged.<clip>.glb [+ .usdz] per clip, <name>-rigged.all.glb, and
+animate.json ("clips", "usdz", "animcheck", "verdict").
+
+CHECK IN REALITYKIT: {root}/viewer/render.sh <screenshot-dir> <path to .usdz> ...
+(front and back renders in the visionOS simulator; uses the GPU briefly)
+
+EXIT CODES: 0 ok, 2 usage, 3 GPU busy, 4 a stage failed (its log path is printed),
+5 cutout refused (regenerate the concept on a plain background).
+More: m3d models (engines, licences, presets), {root}/README.md."""
+
+
+def main():
+    global JSON_OUT
+    d = CFG["defaults"]
+    fmt = argparse.RawDescriptionHelpFormatter
+    ap = argparse.ArgumentParser(prog="m3d", formatter_class=fmt,
+                                 description=__doc__.split("Every model")[0].strip(),
+                                 epilog=RECIPES.format(out=P["out"], root=ROOT))
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    engines = "; ".join(f"{k}: {v.get('role', '')}" for k, v in CFG["engines"].items())
+    presets = "; ".join(f"{k}: {v.get('use_for', '')}" for k, v in CFG["post"].items())
+
+    def common(p, image=True, engine=True):
+        p.add_argument("-o", "--output", help="output folder (default: a new folder under %s)" % P["out"])
+        p.add_argument("--seed", type=int, default=42, help="random seed; same seed + same input = same result")
+        p.add_argument("--dry-run", action="store_true", help="print the plan and commands, run nothing")
+        p.add_argument("--json", action="store_true", help="machine-readable result on stdout")
+        p.add_argument("--force", action="store_true", help="skip the GPU-busy check (do not use on a shared GPU)")
+        p.add_argument("--yield-llm", action="store_true", default=os.environ.get("M3D_YIELD_LLM") == "1",
+                       help="for a local model calling m3d: unload your own model (llama-swap, or a `model` "
+                            "engine, restarted afterwards) and wait for memory to settle; env M3D_YIELD_LLM=1")
+        if image:
+            p.add_argument("--image-model", default=d["image_model"], choices=list(CFG["image_models"]),
+                           help="text-to-image model (default %(default)s; qwen-2.1 is research-licence only)")
+            p.add_argument("--variants", type=int, default=1,
+                           help="how many concept images (different seeds); make meshes only the first")
+            p.add_argument("--rig-ready", action="store_true",
+                           help="for a character you will rig and animate: draw it front-on in a T-pose with gaps "
+                                "under the arms and between the legs (m3d.toml concept.template_rig). Without it, "
+                                "arms drawn against the body fuse to the torso and drag skin when they move")
+        if engine:
+            p.add_argument("--engine", default=d["engine"], choices=list(CFG["engines"]),
+                           help="image-to-3D engine (default %(default)s). " + engines)
+            p.add_argument("--draft", action="store_true", help="untextured shape only, ~15 s (hy3d)")
+
+    def postargs(p, default=None):
+        p.add_argument("--metal", action="store_true", help="bake on the GPU instead of the CPU")
+        p.add_argument("--glass", default="", metavar="TINT",
+                       help="make see-through glass of the faces with this tint (green, blue, cyan, red, "
+                            "yellow, amber, magenta, or a hue in degrees); the engines only paint opaque surfaces")
+        p.add_argument("--glass-alpha", type=float, default=0.45, help="glass opacity, 0-1 (default 0.45)")
+
+    p = sub.add_parser("make", formatter_class=fmt, help="prompt or image -> textured 3D model (the main command)",
+                       description="Text prompt (or an image path) -> concept image -> cutout -> 3D mesh, "
+                                   "and with --post a game/visionOS-ready GLB + USDZ.", epilog=RECIPES.format(out=P["out"], root=ROOT))
+    p.add_argument("input", help='a quoted prompt ("a brass lantern") or a path to an image')
+    common(p)
+    p.add_argument("--post", choices=list(CFG["post"]),
+                   help="also make the finished asset: " + presets)
+    postargs(p)
+    p.set_defaults(fn=cmd_make)
+
+    p = sub.add_parser("concept", formatter_class=fmt, help="prompt -> concept images only (pick one, then `m3d mesh`)",
+                       description="Generate concept images for a prompt, to pick from before meshing.")
+    p.add_argument("prompt", help="a quoted description of one object")
+    common(p, engine=False)
+    p.set_defaults(fn=cmd_concept)
+
+    p = sub.add_parser("mesh", formatter_class=fmt, help="image -> 3D model (with optional --post)",
+                       description="Cut out the background of an image and build a textured 3D mesh from it.")
+    p.add_argument("image", help="path to a concept image or photo of one object")
+    common(p, image=False)
+    p.add_argument("--no-cutout", action="store_true", help="the image already has a transparent background")
+    p.add_argument("--post", choices=list(CFG["post"]), help="also make the finished asset: " + presets)
+    postargs(p)
+    p.set_defaults(fn=cmd_mesh)
+
+    p = sub.add_parser("post", formatter_class=fmt, help="raw .glb -> light GLB + USDZ for games / Vision Pro",
+                       description="Reduce a raw generated mesh, re-bake its textures, make LODs, export GLB and "
+                                   "USDZ (USDZ via Apple's tools, checked with usdchecker).")
+    p.add_argument("glb", help="a raw .glb from m3d mesh/make")
+    common(p, image=False, engine=False)
+    p.add_argument("--preset", default="game", choices=list(CFG["post"]), help=presets)
+    p.add_argument("--faces", type=int, help="override the preset's triangle budget")
+    postargs(p)
+    p.set_defaults(fn=cmd_post)
+
+    riggers = "; ".join(f"{k}: {v.get('role', '')}" for k, v in CFG.get("riggers", {}).items())
+    p = sub.add_parser("rig", formatter_class=fmt, help="textured .glb -> rigged GLB (skeleton, skin weights, bone roles)",
+                       description="Add a skeleton, skin weights and a role per bone (root, body, head, arm.L, …) to a "
+                                   "finished GLB (an m3d post LOD0 is ideal). Output: <dir>/rig/<name>-rigged.glb with "
+                                   "<name>-rigged.roles.json beside it, a rigplot PNG to look at, and rig.json. "
+                                   "SkinTokens runs on Metal (GPU guard applies); puppet is CPU-only Blender.")
+    p.add_argument("glb", help="a textured .glb (one object)")
+    common(p, image=False, engine=False)
+    p.add_argument("--engine", default="skintokens", choices=list(CFG.get("riggers", {})),
+                   help="rigger (default %(default)s). " + riggers)
+    p.add_argument("--spec", default="auto", metavar="auto|spec.json",
+                   help="puppet only: pivot spec JSON (specs/puppet/*.json) or auto (heuristic; the spec it used is "
+                        "written beside the rig so it can be edited and re-run)")
+    p.add_argument("--no-rip", action="store_true",
+                   help="do not split fused limb contacts on bipeds (weightfix --rip; generated humanoids fuse hands to hips)")
+    p.add_argument("--no-weightfix", action="store_true",
+                   help="skintokens only: keep the raw learned weights (default: lib/weightfix.py moves limb weight "
+                        "that bled onto the trunk back, so arms stop dragging the body)")
+    p.add_argument("--check", action="store_true",
+                   help="also render rest/posed checks (puppet) or the role-coloured plot (skintokens); the rigplot "
+                        "PNG is always written")
+    p.add_argument("--cpu", action="store_true", help="skintokens on the CPU instead of Metal (slower, no GPU guard needed)")
+    p.add_argument("--from-raw", metavar="RAW.glb", help=argparse.SUPPRESS)  # graft an existing skin-tokens.cpp output
+    p.set_defaults(fn=cmd_rig)
+
+    p = sub.add_parser("animate", formatter_class=fmt, help="rigged .glb -> animation clips, one GLB (+ USDZ) per clip",
+                       description="Animate a rigged GLB from `m3d rig`: procedural clips keyed on bone roles (any rig), "
+                                   "or humanoid text-to-motion / a BVH retargeted onto a biped rig. One GLB per clip "
+                                   "(Apple's USDZ converter keeps only the first animation of a file) plus <name>.all.glb. "
+                                   "CPU only (Blender, MoMask on CPU): no GPU guard.")
+    p.add_argument("glb", help="<name>-rigged.glb from m3d rig (its .roles.json must sit beside it)")
+    common(p, image=False, engine=False)
+    p.set_defaults(seed=None)
+    p.add_argument("--clips", metavar="a,b,…",
+                   help="procedural clips: " + ",".join(PROCEDURAL_CLIPS) + " (default: all seven when neither --text "
+                        "nor --bvh is given); every clip loops")
+    p.add_argument("--text", metavar='"…"', help='humanoid text-to-motion (MoMask, CPU, research-data licence: not '
+                                                  'for anything sold), e.g. "a person waves hello"; biped rigs only')
+    p.add_argument("--bvh", metavar="clip.bvh", help="retarget your own Mixamo-named BVH onto the rig (biped rigs only)")
+    p.add_argument("--seconds", type=float, help="clip length: default 2 for procedural clips, 4 for --text (max 9.8)")
+    p.add_argument("--fps", type=int, default=30, help="frame rate of the clips (default %(default)s)")
+    p.add_argument("--in-place", action="store_true", help="--text/--bvh: drop the horizontal root travel (treadmill)")
+    p.add_argument("--usdz", action="store_true",
+                   help="also write one USDZ per clip (usdextract + usdzip --arkitAsset + usdchecker); per clip because "
+                        "Apple's converter keeps only the first glTF animation of a file")
+    p.add_argument("--check", action="store_true",
+                   help="lib/animcheck.py on every clip: penetration, stretch, weight bleed, floor sink, a frame sheet "
+                        "with the worst frame marked; verdict ok|warn|fail in the result, exit 4 on fail")
+    p.add_argument("--allow-fail", action="store_true", help="with --check: exit 0 even when a clip's verdict is fail")
+    p.set_defaults(fn=cmd_animate)
+
+    p = sub.add_parser("models", help="list engines, image models, riggers, motion models, licences and presets (JSON)")
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_models)
+    p = sub.add_parser("gpu", help="is the shared GPU free? exit 0 free, 3 busy (and who holds it)")
+    p.add_argument("--json", action="store_true", help="machine-readable result")
+    p.set_defaults(fn=cmd_gpu)
+
+    a = ap.parse_args()
+    JSON_OUT = getattr(a, "json", False)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

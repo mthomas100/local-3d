@@ -1,0 +1,59 @@
+#!/bin/bash
+# memguard CAP_GIB command [args…] — run a heavy job (trimesh, scipy, Blender, torch, skintokens)
+# and kill it when it is the thing exhausting memory.
+#
+# Why (2026-10-02): a Bash tool timeout kills the shell, not a busy child. A trimesh
+# analysis orphaned that way grew to 266 GB resident, exhausted swap and macOS jetsam-
+# killed 1,247 background helpers. Every heavy job in this repo runs under this guard;
+# bin/m3d's run_stage adds a stall limit, this adds the memory cap.
+#
+# Kill rules (2026-10-03 rewrite, after the teddy live test): the first version killed on
+# "system free < 15%" alone and read only the direct child's RSS. With a local LLM resident
+# (qwen38 on ds4-server wires ~110 GB of 128) free sits at 12-14% with ~18 GB actually
+# available, so every Blender job died at its first check with "rss 0 GiB" — the RSS was the
+# `/usr/bin/time` wrapper's, not Blender's. Now:
+#   1. tree RSS (the job and all its descendants) > CAP_GIB                 -> kill (runaway job)
+#   2. available (free + inactive + purgeable + speculative) < FLOOR GiB   -> kill (true exhaustion;
+#      MEMGUARD_FLOOR_GIB, default 4)
+#   3. free% < 15 and tree RSS > CAP_GIB/4                                 -> kill (memory is tight AND
+#      this job is a big part of it; a 1 GB Blender beside a resident LLM keeps running)
+#
+#   bin/memguard 32 ~/.hy3d/worker-venv/bin/python script.py args
+#   bin/memguard 16 /opt/homebrew/bin/blender -b --factory-startup --python lib/puppet.py -- …
+set -u
+cap=${1:?usage: memguard CAP_GIB command [args…]}; shift
+floor=${MEMGUARD_FLOOR_GIB:-4}
+"$@" &
+p=$!
+trap 'kill -TERM $p 2>/dev/null; sleep 2; kill -9 $p 2>/dev/null' INT TERM HUP
+tree_rss_kb() {  # RSS of $1 and every descendant, in KiB
+  ps -A -o pid=,ppid=,rss= 2>/dev/null | awk -v root="$1" '
+    { pp[$1] = $2; rs[$1] = $3 }
+    END { for (q in pp) { x = q; while (x != "" && x != 0 && x != 1) { if (x == root) { s += rs[q]; break } x = pp[x] } } print s + 0 }'
+}
+avail_gib() {    # free + inactive + purgeable + speculative pages, in GiB
+  vm_stat 2>/dev/null | awk '/page size of/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) ps = $i }
+    /^Pages (free|inactive|purgeable|speculative):/ { gsub(/\./, "", $NF); n += $NF }
+    END { printf "%d", n * ps / 1073741824 }'
+}
+while kill -0 "$p" 2>/dev/null; do
+  r=$(tree_rss_kb "$p")
+  f=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print $2+0}')
+  a=$(avail_gib)
+  why=""
+  if [ "${r:-0}" -gt $((cap * 1048576)) ]; then why="tree rss over the cap"
+  elif [ "${a:-99}" -lt "$floor" ]; then why="available ${a} GiB under the ${floor} GiB floor"
+  elif [ "${f:-100}" -lt 15 ] && [ "${r:-0}" -gt $((cap * 262144)) ]; then why="system free under 15% and this job over a quarter of its cap"
+  fi
+  if [ -n "$why" ]; then
+    echo "memguard: killing pid $p ($why: rss $(( ${r:-0} / 1048576 )) GiB, cap $cap GiB, system free ${f:-?}%, available ${a:-?} GiB)" >&2
+    kill -9 "$p" 2>/dev/null
+    # children of the job (Blender's, a venv python's) go with its process group when it is a leader;
+    # otherwise sweep anything still parented to it.
+    pkill -9 -P "$p" 2>/dev/null
+    wait "$p" 2>/dev/null
+    exit 137
+  fi
+  sleep 2
+done
+wait "$p"
