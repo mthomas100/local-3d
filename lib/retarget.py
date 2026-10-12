@@ -456,7 +456,7 @@ def glb_patch(path, fn):
 
 
 def glb_root_mover(js, name="m3d_mover"):
-    """Root motion for RealityKit (2026-10-02, the viewer animation notes, 2026-10-02, not published "Root motion"; the same function as
+    """Root motion for RealityKit (2026-10-02; the same function as
     lib/motion.py's). Apple's usdextract keeps only the joint ROTATIONS of a glTF animation in its SkelAnimation
     (translations stay at rest, scales at 1) and RealityKit's skinning ignores the xformOp samples it bakes on the
     joint prims, so a hips translation (a jump, a walk's bob) never shows and the clip may not play at all.

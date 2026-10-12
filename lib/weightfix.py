@@ -2,8 +2,8 @@
                                [--margin 0.01] [--ball 2.0] [--far 2.5] [--no-misbound] [--harden none|all|5,0] [--json]
 Cleans auto-rig skin weights (SkinTokens and the like) so limbs stop dragging the body and the body stops holding
 limbs, then writes a new GLB (worker venv python: numpy, scipy, pygltflib; run under bin/memguard). Without --rip
-everything but JOINTS_0/WEIGHTS_0 stays byte-identical. Written 2026-10-02 for two SkinTokens faults
-(the lamp animation QA notes, 2026-10-02, not published): the lamp's clavicle owned a patch of its torso wall (arm swings sheared the
+everything but JOINTS_0/WEIGHTS_0 stays byte-identical. Written 2026-10-02 for two SkinTokens faults:
+the lamp's clavicle owned a patch of its torso wall (arm swings sheared the
 torso), and the knight's inner arms were bound to its hips and thighs (a raised arm tore into a fan).
 
 --roles is the role tagger's sidecar ({"roles": {bone: role}} or a flat map); default <input stem>.roles.json.

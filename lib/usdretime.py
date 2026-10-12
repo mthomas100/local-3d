@@ -3,7 +3,7 @@
 usdextract (macOS 27) writes `timeCodesPerSecond = 1` with sample keys in seconds, and
 RealityKit evaluates animation at whole time codes: every Apple-route clip played at one
 sample per second (a 2 s hop became a 3-point triangle, a 2 s breathing idle sampled to
-nothing; measured 2026-10-02, see the viewer animation notes, 2026-10-02, not published "Root motion").
+nothing; measured 2026-10-02).
 This multiplies every sample key, start/endTimeCode by `fps` and sets timeCodesPerSecond
 and framesPerSecond to `fps`, through `usdcat` (no pxr module on this Mac: a regex over
 the usda text), then writes the layer back in its original format. Run by bin/m3d's

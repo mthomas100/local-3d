@@ -1,7 +1,7 @@
 """animcheck.py clip.glb [--anim 0] [--fps 24] [--frames DIR] [--render] [--rig RIG.glb] [--roles R.json] [--out PREFIX] [--json]
 The numeric and visual QA of a skinned animation (worker venv python: numpy, scipy, pygltflib, PIL, matplotlib;
-Blender only for --render). Written 2026-10-02 after the lamp-wave clip, whose left arm swung through its own torso
-(the lamp animation QA notes, 2026-10-02, not published). Input: an ANIMATED glTF/GLB (skin + animation channels), or a rigged GLB
+Blender only for --render). Written 2026-10-02 after the lamp-wave clip, whose left arm swung through its own torso.
+Input: an ANIMATED glTF/GLB (skin + animation channels), or a rigged GLB
 without animation plus --frames (then only the rest-pose checks and the sheet).
 
 Numeric part (no Blender): samples the glTF animation at --fps, evaluates linear blend skinning in numpy

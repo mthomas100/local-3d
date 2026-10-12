@@ -77,7 +77,7 @@ BUSY_PROCS = ["ltx-2-mlx", "ltx_pipelines", "story.sh", "redo.sh", "run-queue.sh
               "mflux-generate", "hy3d", "comfy3d.py", "mlxserve3d.py", "main.py", "mlx-serve",
               "skintokens-cli"]  # the SkinTokens rigger runs on Metal (m3d rig, 2026-10-02)
 # Language-model engines. llama-swap's /running shows its own children, but an engine
-# started with `model <target>` (ds4-serve) is only visible as a process (film rig, 2026-09-23).
+# started outside llama-swap (a ds4 server, say) is only visible as a process (film rig, 2026-09-23).
 LLM_PROCS = ["ds4-server", "llama-server"]
 # A venv's python shows up in ps under its real interpreter path, so ComfyUI
 # is matched by its arguments, not by "ComfyUI/.venv" (missed, 2026-09-26).
@@ -85,7 +85,7 @@ LLM_PROCS = ["ds4-server", "llama-server"]
 
 # Programs that never touch the GPU, however their arguments read.
 NOT_GPU = {"gh", "git", "grep", "rg", "ugrep", "tail", "head", "less", "more", "cat", "vim", "nvim",
-           "curl", "ssh", "pgrep", "ps", "lsof", "sed", "awk", "open", "code", "kb", "find", "ls"}
+           "curl", "ssh", "pgrep", "ps", "lsof", "sed", "awk", "open", "code", "find", "ls"}
 
 
 def is_gpu_job(cmd):
@@ -143,7 +143,7 @@ def gpu_holders():
 
 
 # ---------- the Mac's GPU hold (2026-10-04; optional, see github.com/mthomas100/local-rig) ----------
-# One lock for the GPU, shared with the film rig and the owner's `hold on`, kept by the hold gate in front of
+# One lock for the GPU, shared with the film rig and a manual `hold on`, kept by the hold gate in front of
 # llama-swap (:8090). An m3d command's first GPU stage queues for it (behind a render it waits instead of failing),
 # the gate lets the LLM's calls in flight finish and unloads it, and every agent's next model call waits until
 # this m3d run ends (the hold ends with the process). Inside a hold (HOLD_ID: a script that already holds the GPU)
@@ -192,7 +192,7 @@ def guard(force, yield_llm=False):
 # memory settles, run, and let the model come back on the agent's next request. Opt-in
 # only: unloading is right when the caller owns the model, never on someone else's.
 SWAP = "http://127.0.0.1:8090"
-DS4_DIR = Path(os.environ.get("M3D_DS4_DIR", Path.home() / "repos" / "ds4"))  # a ds4-serve checkout, if any
+DS4_DIR = Path(os.environ.get("M3D_DS4_DIR", Path.home() / "repos" / "ds4"))  # a ds4 checkout with a `model` launcher script, if any
 WIRED_MAX_GB = 40
 _restart_target = None
 YIELD = {}  # what --yield-llm did, returned in the JSON result
@@ -224,7 +224,7 @@ def _llm_procs():
 
 
 def _restart_engine():
-    """atexit: bring back a ds4-serve engine stopped for this run, success or failure."""
+    """atexit: bring back a ds4 engine stopped for this run, success or failure."""
     global _restart_target
     t, _restart_target = _restart_target, None
     if not t:
@@ -255,9 +255,9 @@ def yield_language_model(holders):
         st = subprocess.run([str(DS4_DIR / "model"), "status", "--porcelain"], cwd=DS4_DIR,
                             capture_output=True, text=True).stdout
         target = dict(l.split("=", 1) for l in st.splitlines() if "=" in l).get("target", "").strip()
-        log(f"[yield] stopping the ds4-serve engine {target or '(unknown)'} with `model stop`")
+        log(f"[yield] stopping the ds4 engine {target or '(unknown)'} with `model stop`")
         subprocess.run([str(DS4_DIR / "model"), "stop", "--yes"], cwd=DS4_DIR, capture_output=True, text=True)
-        YIELD.update(unloaded=[target or "ds4-serve engine"], via="model stop",
+        YIELD.update(unloaded=[target or "ds4 engine"], via="model stop",
                      restarts_after=target or None)
         if target:
             _restart_target = target

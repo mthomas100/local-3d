@@ -190,7 +190,7 @@ def key_value(name, v):
     """squash / stretch amount 0..1 for this frame (1.0 = the puppet shape key's full deformation)"""
     shape[name] = shape.get(name, 0.0) + v
 # Squash/stretch is baked as non-uniform SCALE on the root bone (else the body): Apple's usdextract drops glTF
-# blend-weight animation (viewer probe, the viewer animation notes, 2026-10-02, not published), so shape keys never reach RealityKit.
+# blend-weight animation (viewer probe, 2026-10-02), so shape keys never reach RealityKit.
 # A pose-bone scale is about the bone head, which puppet.py puts at the bbox bottom centre, so the feet stay
 # planted and every child bone inherits the squash. Same factors as the shape keys: squash Y 0.85 / XZ 1.08,
 # stretch Y 1.12 / XZ 0.95, interpolated by the amount.
@@ -629,7 +629,7 @@ def glb_animations(path):
     jlen = struct.unpack_from("<I", d, 12)[0]; js = json.loads(d[20:20 + jlen])
     return [(an.get("name"), len(an["channels"])) for an in js.get("animations", [])]
 def glb_root_mover(js, name="m3d_mover"):
-    """Root motion for RealityKit (2026-10-02, the viewer animation notes, 2026-10-02, not published "Root motion"). Apple's usdextract keeps
+    """Root motion for RealityKit (2026-10-02). Apple's usdextract keeps
     only the joint ROTATIONS of a glTF animation in its SkelAnimation (translations stay at rest, scales at 1) and
     RealityKit's skinning ignores the xformOp samples it bakes on the joint prims, so the hop never left the ground
     and idle never breathed; a clip whose root joint has translation/scale channels did not play at all. RealityKit

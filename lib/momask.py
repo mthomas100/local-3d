@@ -91,7 +91,7 @@ import numpy as np
 REPO = os.environ.get("MOMASK_REPO", os.path.join(os.environ.get("M3D_REPOS", os.path.expanduser("~/repos")), "momask-codes"))
 sys.path.insert(0, REPO)
 
-# CPU pinning (2026-10-02, asked by the Mac's memory watchdog): gen_t2m.py picks its device
+# CPU pinning (2026-10-02): gen_t2m.py picks its device
 # in one line, torch.device("cpu" if gpu_id == -1 else "cuda:N"), and the code has no MPS
 # path at all; lib/momask.py always passes --gpu_id -1. Refuse anything else and drop the
 # MPS fallback switch before torch is imported. (Overriding torch's is_available probes was
